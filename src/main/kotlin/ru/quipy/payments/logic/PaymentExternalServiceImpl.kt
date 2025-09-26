@@ -56,11 +56,12 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), 1.seconds.toJavaDuration())
     private val requestQueue: BlockingQueue<PaymentRequest> = LinkedBlockingQueue()
 
-    private val executorThreadNumber = 1
+    private val executorThreadNumber = 16
     private val executorService = Executors.newFixedThreadPool(executorThreadNumber)
     private val coroutineScope = CoroutineScope(executorService.asCoroutineDispatcher() + SupervisorJob())
 
-    private val maxConcurrentRequests: Int = (rateLimitPerSec * requestAverageProcessingTime.toKotlinDuration().toDouble(DurationUnit.SECONDS)).toInt().coerceAtLeast(1)
+    //private val maxConcurrentRequests: Int = (rateLimitPerSec * requestAverageProcessingTime.toKotlinDuration().toDouble(DurationUnit.SECONDS)).toInt().coerceAtLeast(1)
+    private val maxConcurrentRequests: Int = parallelRequests
     private val requestSemaphore = Semaphore(permits = maxConcurrentRequests)
 
     init {
