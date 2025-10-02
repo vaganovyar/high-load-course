@@ -1,0 +1,70 @@
+server:
+    address: 0.0.0.0
+    http2.enabled: true
+    port: 8081
+
+spring:
+  # Postgres event store properties
+  datasource:
+    hikari:
+      username: tiny_es
+      jdbc-url: jdbc:postgresql://${POSTGRES_ADDRESS:localhost}:${POSTGRES_PORT:65432}/postgres
+      leak-detection-threshold: 2000
+      password: tiny_es
+  main:
+    allow-bean-definition-overriding: true
+  # MongoDB properties
+  data:
+    mongodb:
+      port: 27017
+      host: localhost
+      database: online-shop
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: info,health,prometheus,metrics
+  metrics:
+    export:
+      prometheus.enabled: true
+    web:
+      server:
+        request.autotime.percentiles: 0.95
+
+# Tiny event sourcing library properties
+event:
+  sourcing:
+    sagas-enabled: false
+    snapshots-enabled: false
+    scan-package: ru.quipy
+    auto-scan-enabled: true
+
+payment:
+  hostPort: ${PAYMENT_HOST:localhost}:${PAYMENT_PORT:1234}
+  accounts: ${PAYMENT_ACCOUNTS:acc-12,acc-20}
+  token: ${PAYMENT_TOKEN}
+  service-name: ${PAYMENT_SERVICE_NAME}
+
+metrics:
+  incoming-requests:
+    name: incoming_requests
+    description: "incoming requests"
+    tags:
+      - method
+      - uri
+  outgoing-responses:
+    name: outgoing_responses
+    description: "outgoing responses"
+    tags:
+      - method
+      - uri
+  completed-tasks:
+    name: completed_tasks
+    description: "completed tasks"
+    tags:
+      - method
+
+thread-pools:
+  payment-external-service-thread-pool-config:
+    threads-number: 16
