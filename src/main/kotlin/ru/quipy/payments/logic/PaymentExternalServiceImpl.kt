@@ -10,7 +10,9 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
+import ru.quipy.config.ThreadPoolsConfig
 import ru.quipy.core.EventSourcingService
+import ru.quipy.metrics.MetricsService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.util.*
@@ -19,9 +21,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
-import kotlin.time.DurationUnit
 import kotlin.time.toJavaDuration
-import kotlin.time.toKotlinDuration
 
 data class PaymentRequest(
     val paymentId: UUID,
@@ -37,6 +37,8 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
+    private val threadPoolsConfig: ThreadPoolsConfig,
+    private val metricsService: MetricsService
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -44,6 +46,8 @@ class PaymentExternalSystemAdapterImpl(
 
         val emptyBody = ByteArray(0).toRequestBody(null)
         val mapper = ObjectMapper().registerKotlinModule()
+
+        private const val TASK_NAME = "paymentTask"
     }
 
     private val serviceName = properties.serviceName
@@ -56,11 +60,10 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), 1.seconds.toJavaDuration())
     private val requestQueue: BlockingQueue<PaymentRequest> = LinkedBlockingQueue()
 
-    private val executorThreadNumber = 16
+    private val executorThreadNumber = threadPoolsConfig.paymentExternalServiceThreadPoolConfig.threadsNumber
     private val executorService = Executors.newFixedThreadPool(executorThreadNumber)
     private val coroutineScope = CoroutineScope(executorService.asCoroutineDispatcher() + SupervisorJob())
 
-    //private val maxConcurrentRequests: Int = (rateLimitPerSec * requestAverageProcessingTime.toKotlinDuration().toDouble(DurationUnit.SECONDS)).toInt().coerceAtLeast(1)
     private val maxConcurrentRequests: Int = parallelRequests
     private val requestSemaphore = Semaphore(permits = maxConcurrentRequests)
 
@@ -91,6 +94,8 @@ class PaymentExternalSystemAdapterImpl(
                     }
                     processPaymentRequest(request)
                 }
+
+                metricsService.incrementCompletedTask(TASK_NAME)
             } catch (e: Exception) {
                 logger.error("[$accountName] Error processing request queue", e)
             }
