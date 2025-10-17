@@ -64,6 +64,11 @@ metrics:
     description: "completed tasks"
     tags:
       - method
+  queue-size:
+    name: payment_queue_size
+    description: "payment queue size"
+    tags:
+      - account
 
 thread-pools:
   payment-external-service-thread-pool-config:

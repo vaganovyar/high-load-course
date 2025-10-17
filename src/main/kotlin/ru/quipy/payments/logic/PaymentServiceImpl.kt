@@ -3,7 +3,6 @@ package ru.quipy.payments.logic
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
-import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.time.Duration
@@ -21,9 +20,23 @@ class PaymentSystemImpl(
         val logger = LoggerFactory.getLogger(PaymentSystemImpl::class.java)
     }
 
-    override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    override fun submitPaymentRequest(orderId: UUID, paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        var bestRetryAfterTimestamp: Long? = null
+        
         for (account in paymentAccounts) {
-            account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
+            try {
+                account.performPaymentAsync(paymentId, orderId, amount, paymentStartedAt, deadline)
+                return
+            } catch (e: TooManyRequestsException) {
+                logger.warn("Account ${account.name()} rejected payment $paymentId due to back pressure")
+                // Keep the earliest retry timestamp
+                e.retryAfterTimestamp?.let { timestamp ->
+                    if (bestRetryAfterTimestamp == null || timestamp < bestRetryAfterTimestamp!!) {
+                        bestRetryAfterTimestamp = timestamp
+                    }
+                }
+            }
         }
+        throw TooManyRequestsException("All payment accounts are under back pressure", bestRetryAfterTimestamp)
     }
 }
