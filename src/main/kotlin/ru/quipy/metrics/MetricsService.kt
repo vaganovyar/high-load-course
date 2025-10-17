@@ -1,6 +1,7 @@
 package ru.quipy.metrics
 
 import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Tag
 import org.springframework.stereotype.Service
@@ -22,6 +23,14 @@ class MetricsService(
 
     fun incrementCompletedTask(method: String) {
         registerCounter(metricsConfig.completedTasks, listOf(method)).increment()
+    }
+
+    fun registerQueueSizeGauge(accountName: String, gaugeObject: Any, valueFunction: () -> Double) {
+        val tags = listOf(Tag.of("account", accountName))
+        Gauge.builder(metricsConfig.queueSize.name, gaugeObject) { valueFunction() }
+            .description(metricsConfig.queueSize.description)
+            .tags(tags)
+            .register(Metrics.globalRegistry)
     }
 
     private fun registerCounter(config: MetricsConfig.MetricProperties, tags: List<String>): Counter {

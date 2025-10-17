@@ -6,8 +6,9 @@ import java.util.*
 interface PaymentService {
     /**
      * Submit payment request to some external service.
+     * @throws TooManyRequestsException if back pressure is applied
      */
-    fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
+    fun submitPaymentRequest(orderId: UUID, paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
 }
 
 /**
@@ -17,7 +18,7 @@ interface PaymentService {
 
  */
 interface PaymentExternalSystemAdapter {
-    fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
+    fun performPaymentAsync(paymentId: UUID,  orderId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
 
     fun name(): String
 

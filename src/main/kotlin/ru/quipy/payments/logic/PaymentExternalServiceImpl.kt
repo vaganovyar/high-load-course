@@ -14,6 +14,7 @@ import ru.quipy.config.ThreadPoolsConfig
 import ru.quipy.core.EventSourcingService
 import ru.quipy.metrics.MetricsService
 import ru.quipy.payments.api.PaymentAggregate
+import ru.quipy.payments.logic.OrderPayer.Companion
 import java.net.SocketTimeoutException
 import java.util.*
 import java.util.concurrent.BlockingQueue
@@ -68,6 +69,8 @@ class PaymentExternalSystemAdapterImpl(
     private val requestSemaphore = Semaphore(permits = maxConcurrentRequests)
 
     init {
+        metricsService.registerQueueSizeGauge(accountName, this) { requestQueue.size.toDouble() }
+        
         repeat(executorThreadNumber) {
             coroutineScope.launch {
                 processRequestQueue()
@@ -75,11 +78,32 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    override fun performPaymentAsync(paymentId: UUID, orderId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val transactionId = UUID.randomUUID()
+
+        val processingTimeSeconds = requestAverageProcessingTime.toMillis() / 1000.0
+        val maxRpsFromConcurrency = maxConcurrentRequests / processingTimeSeconds
+        val effectiveRps = minOf(maxRpsFromConcurrency, rateLimitPerSec.toDouble())
+
+        val timeRemaining = deadline - now()
+        val timeNeededToProcessQueue = requestQueue.size / effectiveRps * 1000 * 1.1 // in milliseconds
+
+        if (timeRemaining <= 0 || timeNeededToProcessQueue > timeRemaining) {
+            val retryAfterTimestamp = now() + (requestQueue.size / effectiveRps * 1000 * 1.1).toLong()
+            throw TooManyRequestsException("Too many requests", retryAfterTimestamp)
+        }
+
+        val createdEvent = paymentESService.create {
+            it.create(
+                paymentId,
+                orderId,
+                amount
+            )
+        }
 
         val request = PaymentRequest(paymentId, amount, paymentStartedAt, deadline, transactionId)
         requestQueue.offer(request)
+        OrderPayer.logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
         logger.warn("[$accountName] Submitted payment request into queue $paymentId, time spent ${now() - paymentStartedAt} ms")
     }
 
