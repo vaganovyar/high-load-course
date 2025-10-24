@@ -90,10 +90,10 @@ class PaymentExternalSystemAdapterImpl(
         val effectiveRps = minOf(maxRpsFromConcurrency, rateLimitPerSec.toLong())
 
         val timeRemaining = deadline - now()
-        val timeNeededToProcessQueue = requestQueue.size / effectiveRps * 1000 * 1.1 // in milliseconds
+        val timeNeededToProcessQueue = ((requestQueue.size.toDouble() / effectiveRps * 1000 + requestAverageProcessingTime.toMillis()) * 1.1).toLong() // in milliseconds
 
         if (timeRemaining <= 0 || timeNeededToProcessQueue > timeRemaining) {
-            val retryAfterTimestamp = now() + (requestQueue.size / effectiveRps * 1000 * 1.1).toLong()
+            val retryAfterTimestamp = now() + timeNeededToProcessQueue
 
             logger.warn("[$accountName] TooManyRequestsException for paymemt $paymentId, retry-after time $retryAfterTimestamp ms")
             throw TooManyRequestsException("Too many requests", retryAfterTimestamp)
