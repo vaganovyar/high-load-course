@@ -26,6 +26,7 @@ import kotlin.time.toJavaDuration
 
 data class PaymentRequest(
     val paymentId: UUID,
+    val orderId: UUID,
     val amount: Int,
     val paymentStartedAt: Long,
     val deadline: Long,
@@ -72,6 +73,7 @@ class PaymentExternalSystemAdapterImpl(
     private var lastRetryAfterTimestamp: Long? = null
 
     private val queueLock = Any()
+    private val retriedPayments = Collections.synchronizedSet(HashSet<UUID>())
 
     init {
         metricsService.registerQueueSizeGauge(accountName, this) { requestQueue.size.toDouble() }
@@ -126,7 +128,7 @@ class PaymentExternalSystemAdapterImpl(
                 )
             }
 
-            val request = PaymentRequest(paymentId, amount, paymentStartedAt, deadline, transactionId)
+            val request = PaymentRequest(paymentId, orderId, amount, paymentStartedAt, deadline, transactionId)
             requestQueue.offer(request)
             logger.info("[$accountName] Submitted payment request into queue $paymentId, time spent ${currentTime - paymentStartedAt} ms, queue size ${requestQueue.size}, time needed $timeNeededToProcessQueueWithNewRequest")
         }
@@ -212,6 +214,21 @@ class PaymentExternalSystemAdapterImpl(
                 withContext(Dispatchers.IO) {
                     paymentESService.update(request.paymentId) {
                         it.logProcessing(body.result, now(), request.transactionId, reason = body.message)
+                    }
+                }
+                
+                // Если это был ретрай, удаляем payment из HashSet
+                if (retriedPayments.contains(request.paymentId)) {
+                    retriedPayments.remove(request.paymentId)
+                } else if (!body.result) {
+                    // Если результат неуспешный и для этого payment еще не было ретрая, пробуем сделать ретрай
+                    retriedPayments.add(request.paymentId)
+                    try {
+                        performPaymentAsync(request.paymentId, request.orderId, request.amount, request.paymentStartedAt, request.deadline)
+                        logger.info("[$accountName] Retry submitted for payment ${request.paymentId}, txId: ${request.transactionId}")
+                    } catch (e: Exception) {
+                        retriedPayments.remove(request.paymentId)
+                        logger.warn("[$accountName] Retry failed for payment ${request.paymentId}, txId: ${request.transactionId}", e)
                     }
                 }
             }
