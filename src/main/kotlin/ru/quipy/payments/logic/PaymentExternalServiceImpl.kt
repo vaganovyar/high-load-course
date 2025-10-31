@@ -110,7 +110,7 @@ class PaymentExternalSystemAdapterImpl(
             // ceil is needed because we need 2s to process 12 requests with 11rps (11 requests in first sec + 1 request in second sec)
             val timeNeededToProcessQueueWithNewRequest = (requestQueue.size + effectiveRps) / effectiveRps * 1000 + requestAverageProcessingTime.toMillis() // in milliseconds
 
-            if (timeRemaining <= 0 || timeNeededToProcessQueueWithNewRequest + 300 > timeRemaining) {
+            if (timeRemaining <= 0 || timeNeededToProcessQueueWithNewRequest + 100 > timeRemaining) {
                 lastRetryAfterTimestamp = currentTime + timeNeededToProcessQueueWithNewRequest
 
                 logger.warn("[$accountName] TooManyRequestsException for paymemt $paymentId, retry-after time $lastRetryAfterTimestamp ms, queue size ${requestQueue.size}, time needed $timeNeededToProcessQueueWithNewRequest")
@@ -136,7 +136,7 @@ class PaymentExternalSystemAdapterImpl(
             try {
                 val request = requestQueue.take()
 
-                if (now() + requestAverageProcessingTime.toMillis() > request.deadline) {
+                if (now() + requestAverageProcessingTime.toMillis() + 100 > request.deadline) {
                     continue
                 }
 
@@ -144,14 +144,15 @@ class PaymentExternalSystemAdapterImpl(
                     withContext(Dispatchers.IO) {
                         rateLimiter.tickBlocking()
                     }
-                    
-                    val currentTime = now()
-                    if (currentTime + requestAverageProcessingTime.toMillis() > request.deadline) {
-                        rateLimiter.returnToken()
-                        logger.warn("[$accountName] Request ${request.paymentId} missed deadline, returning token to rate limiter")
-                    } else {
-                        processPaymentRequest(request)
-                    }
+                    processPaymentRequest(request)
+                    // TODO: nice idea but token returns into new window and rate limit is breached for good requests
+                    // val currentTime = now()
+                    // if (currentTime + requestAverageProcessingTime.toMillis() > request.deadline) {
+                    //     rateLimiter.returnToken()
+                    //     logger.warn("[$accountName] Request ${request.paymentId} missed deadline, returning token to rate limiter")
+                    // } else {
+                    //     processPaymentRequest(request)
+                    // }
                 }
 
                 metricsService.incrementCompletedTask(TASK_NAME)
