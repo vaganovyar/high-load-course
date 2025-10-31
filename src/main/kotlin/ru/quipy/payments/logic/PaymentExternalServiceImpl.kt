@@ -120,12 +120,14 @@ class PaymentExternalSystemAdapterImpl(
                 throw TooManyRequestsException("Too many requests", lastRetryAfterTimestamp)
             }
 
-            val createdEvent = paymentESService.create {
-                it.create(
-                    paymentId,
-                    orderId,
-                    amount
-                )
+            if (!retriedPayments.contains(paymentId)) {
+                val createdEvent = paymentESService.create {
+                    it.create(
+                        paymentId,
+                        orderId,
+                        amount
+                    )
+                }
             }
 
             val request = PaymentRequest(paymentId, orderId, amount, paymentStartedAt, deadline, transactionId)
@@ -207,7 +209,7 @@ class PaymentExternalSystemAdapterImpl(
                     )
                 }
 
-                logger.info("[$accountName] Payment processed for txId: ${request.transactionId}, payment: ${request.paymentId}, succeeded: ${body.result}, message: ${body.message}, time spent ${now() - request.paymentStartedAt} ms")
+                logger.info("[$accountName] Payment processed for txId: ${request.transactionId}, payment: ${request.paymentId}, succeeded: ${body.result}, result code: ${resp.code}, message: ${body.message}, time spent ${now() - request.paymentStartedAt} ms")
 
                 // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
                 // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
