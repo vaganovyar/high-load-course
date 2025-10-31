@@ -144,7 +144,14 @@ class PaymentExternalSystemAdapterImpl(
                     withContext(Dispatchers.IO) {
                         rateLimiter.tickBlocking()
                     }
-                    processPaymentRequest(request)
+                    
+                    val currentTime = now()
+                    if (currentTime + requestAverageProcessingTime.toMillis() > request.deadline) {
+                        rateLimiter.returnToken()
+                        logger.warn("[$accountName] Request ${request.paymentId} missed deadline, returning token to rate limiter")
+                    } else {
+                        processPaymentRequest(request)
+                    }
                 }
 
                 metricsService.incrementCompletedTask(TASK_NAME)
@@ -170,15 +177,18 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.info("[$accountName] Submit: ${request.paymentId} , txId: ${request.transactionId}, time spent ${now() - request.paymentStartedAt} ms")
 
-        try {
-            val httpRequest = Request.Builder().run {
-                url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=${request.transactionId}&paymentId=${request.paymentId}&amount=${request.amount}")
-                post(emptyBody)
-            }.build()
+        val httpRequest = Request.Builder().run {
+            url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=${request.transactionId}&paymentId=${request.paymentId}&amount=${request.amount}")
+            post(emptyBody)
+        }.build()
 
+        val requestStartTime = now()
+        try {
             val response = withContext(Dispatchers.IO) {
                 client.newCall(httpRequest).execute()
             }
+            val responseTime = now() - requestStartTime
+            metricsService.recordExternalSystemResponseTime(accountName, responseTime)
 
             response.use { resp ->
                 val body = try {
@@ -204,6 +214,9 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         } catch (e: Exception) {
+            val responseTime = now() - requestStartTime
+            metricsService.recordExternalSystemResponseTime(accountName, responseTime)
+            
             when (e) {
                 is SocketTimeoutException -> {
                     logger.error(

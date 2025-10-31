@@ -69,6 +69,11 @@ metrics:
     description: "payment queue size"
     tags:
       - account
+  external-system-response-time:
+    name: external_system_response_time
+    description: "external system response time in milliseconds"
+    tags:
+      - account
 
 thread-pools:
   payment-external-service-thread-pool-config:

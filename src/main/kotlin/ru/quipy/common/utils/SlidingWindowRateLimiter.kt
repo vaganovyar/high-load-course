@@ -39,6 +39,14 @@ class SlidingWindowRateLimiter(
         }
     }
 
+    /**
+     * Возвращает токен обратно в рейт лимитер.
+     * Уменьшает счетчик токенов, чтобы освободить место для других запросов.
+     */
+    fun returnToken() {
+        sum.decrementAndGet()
+    }
+
     data class Measure(
         val value: Long,
         val timestamp: Long

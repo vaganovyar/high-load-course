@@ -4,6 +4,7 @@ import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Tag
+import io.micrometer.core.instrument.Timer
 import org.springframework.stereotype.Service
 import ru.quipy.config.MetricsConfig
 
@@ -31,6 +32,17 @@ class MetricsService(
             .description(metricsConfig.queueSize.description)
             .tags(tags)
             .register(Metrics.globalRegistry)
+    }
+
+    fun recordExternalSystemResponseTime(accountName: String, durationMillis: Long) {
+        val tags = listOf(Tag.of("account", accountName))
+        val timer = Timer
+            .builder(metricsConfig.externalSystemResponseTime.name)
+            .description(metricsConfig.externalSystemResponseTime.description)
+            .tags(tags)
+            .publishPercentiles(0.5, 0.75, 0.9, 0.95, 0.99)
+            .register(Metrics.globalRegistry)
+        timer.record(durationMillis, java.util.concurrent.TimeUnit.MILLISECONDS)
     }
 
     private fun registerCounter(config: MetricsConfig.MetricProperties, tags: List<String>): Counter {
