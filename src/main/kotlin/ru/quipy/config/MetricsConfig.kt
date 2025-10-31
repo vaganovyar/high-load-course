@@ -10,6 +10,7 @@ class MetricsConfig(
     var outgoingResponses: MetricProperties = MetricProperties(),
     var completedTasks: MetricProperties = MetricProperties(),
     var queueSize: MetricProperties = MetricProperties(),
+    var externalSystemResponseTime: MetricProperties = MetricProperties(),
 ) {
     data class MetricProperties(
         var name: String = "defaultName",

@@ -14,7 +14,6 @@ import ru.quipy.config.ThreadPoolsConfig
 import ru.quipy.core.EventSourcingService
 import ru.quipy.metrics.MetricsService
 import ru.quipy.payments.api.PaymentAggregate
-import ru.quipy.payments.logic.OrderPayer.Companion
 import java.net.SocketTimeoutException
 import java.util.*
 import java.util.concurrent.BlockingQueue
@@ -68,9 +67,14 @@ class PaymentExternalSystemAdapterImpl(
     private val maxConcurrentRequests: Int = parallelRequests
     private val requestSemaphore = Semaphore(permits = maxConcurrentRequests)
 
+    @Volatile
+    private var lastRetryAfterTimestamp: Long? = null
+
+    private val queueLock = Any()
+
     init {
         metricsService.registerQueueSizeGauge(accountName, this) { requestQueue.size.toDouble() }
-        
+
         repeat(executorThreadNumber) {
             coroutineScope.launch {
                 processRequestQueue()
@@ -78,33 +82,53 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
-    override fun performPaymentAsync(paymentId: UUID, orderId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        val transactionId = UUID.randomUUID()
+    override fun performPaymentAsync(
+        paymentId: UUID,
+        orderId: UUID,
+        amount: Int,
+        paymentStartedAt: Long,
+        deadline: Long
+    ) { 
+        synchronized(queueLock) {
+            val currentTime = now()
 
-        val processingTimeSeconds = requestAverageProcessingTime.toMillis() / 1000.0
-        val maxRpsFromConcurrency = maxConcurrentRequests / processingTimeSeconds
-        val effectiveRps = minOf(maxRpsFromConcurrency, rateLimitPerSec.toDouble())
+            lastRetryAfterTimestamp?.let { retryAfter ->
+                if (currentTime < retryAfter) {
+                    logger.warn("[$accountName] TooManyRequestsException for payment $paymentId, retry-after time $retryAfter ms (from previous rejection)")
+                    throw TooManyRequestsException("Too many requests", retryAfter)
+                }
+            }
 
-        val timeRemaining = deadline - now()
-        val timeNeededToProcessQueue = requestQueue.size / effectiveRps * 1000 * 1.1 // in milliseconds
+            val transactionId = UUID.randomUUID()
+            val maxRpsFromConcurrency = maxConcurrentRequests / requestAverageProcessingTime.seconds
+            val effectiveRps = minOf(maxRpsFromConcurrency, rateLimitPerSec.toLong())
 
-        if (timeRemaining <= 0 || timeNeededToProcessQueue > timeRemaining) {
-            val retryAfterTimestamp = now() + (requestQueue.size / effectiveRps * 1000 * 1.1).toLong()
-            throw TooManyRequestsException("Too many requests", retryAfterTimestamp)
+            val timeRemaining = deadline - currentTime
+
+            // requestAverageProcessingTime.toMillis() == to wait already sended requests
+            // (requestQueue.size + 1 + effectiveRps) / effectiveRps == to process queue with current request added
+            // ceil is needed because we need 2s to process 12 requests with 11rps (11 requests in first sec + 1 request in second sec)
+            val timeNeededToProcessQueueWithNewRequest = (requestQueue.size + effectiveRps) / effectiveRps * 1000 + requestAverageProcessingTime.toMillis() // in milliseconds
+
+            if (timeRemaining <= 0 || timeNeededToProcessQueueWithNewRequest + 100 > timeRemaining) {
+                lastRetryAfterTimestamp = currentTime + timeNeededToProcessQueueWithNewRequest
+
+                logger.warn("[$accountName] TooManyRequestsException for paymemt $paymentId, retry-after time $lastRetryAfterTimestamp ms, queue size ${requestQueue.size}, time needed $timeNeededToProcessQueueWithNewRequest")
+                throw TooManyRequestsException("Too many requests", lastRetryAfterTimestamp)
+            }
+
+            val createdEvent = paymentESService.create {
+                it.create(
+                    paymentId,
+                    orderId,
+                    amount
+                )
+            }
+
+            val request = PaymentRequest(paymentId, amount, paymentStartedAt, deadline, transactionId)
+            requestQueue.offer(request)
+            logger.info("[$accountName] Submitted payment request into queue $paymentId, time spent ${currentTime - paymentStartedAt} ms, queue size ${requestQueue.size}, time needed $timeNeededToProcessQueueWithNewRequest")
         }
-
-        val createdEvent = paymentESService.create {
-            it.create(
-                paymentId,
-                orderId,
-                amount
-            )
-        }
-
-        val request = PaymentRequest(paymentId, amount, paymentStartedAt, deadline, transactionId)
-        requestQueue.offer(request)
-        OrderPayer.logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
-        logger.warn("[$accountName] Submitted payment request into queue $paymentId, time spent ${now() - paymentStartedAt} ms")
     }
 
     private suspend fun processRequestQueue() {
@@ -112,11 +136,23 @@ class PaymentExternalSystemAdapterImpl(
             try {
                 val request = requestQueue.take()
 
+                if (now() + requestAverageProcessingTime.toMillis() + 100 > request.deadline) {
+                    continue
+                }
+
                 requestSemaphore.withPermit {
                     withContext(Dispatchers.IO) {
                         rateLimiter.tickBlocking()
                     }
                     processPaymentRequest(request)
+                    // TODO: nice idea but token returns into new window and rate limit is breached for good requests
+                    // val currentTime = now()
+                    // if (currentTime + requestAverageProcessingTime.toMillis() > request.deadline) {
+                    //     rateLimiter.returnToken()
+                    //     logger.warn("[$accountName] Request ${request.paymentId} missed deadline, returning token to rate limiter")
+                    // } else {
+                    //     processPaymentRequest(request)
+                    // }
                 }
 
                 metricsService.incrementCompletedTask(TASK_NAME)
@@ -142,15 +178,18 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.info("[$accountName] Submit: ${request.paymentId} , txId: ${request.transactionId}, time spent ${now() - request.paymentStartedAt} ms")
 
-        try {
-            val httpRequest = Request.Builder().run {
-                url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=${request.transactionId}&paymentId=${request.paymentId}&amount=${request.amount}")
-                post(emptyBody)
-            }.build()
+        val httpRequest = Request.Builder().run {
+            url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=${request.transactionId}&paymentId=${request.paymentId}&amount=${request.amount}")
+            post(emptyBody)
+        }.build()
 
+        val requestStartTime = now()
+        try {
             val response = withContext(Dispatchers.IO) {
                 client.newCall(httpRequest).execute()
             }
+            val responseTime = now() - requestStartTime
+            metricsService.recordExternalSystemResponseTime(accountName, responseTime)
 
             response.use { resp ->
                 val body = try {
@@ -165,7 +204,7 @@ class PaymentExternalSystemAdapterImpl(
                     )
                 }
 
-                logger.warn("[$accountName] Payment processed for txId: ${request.transactionId}, payment: ${request.paymentId}, succeeded: ${body.result}, message: ${body.message}, time spent ${now() - request.paymentStartedAt} ms")
+                logger.info("[$accountName] Payment processed for txId: ${request.transactionId}, payment: ${request.paymentId}, succeeded: ${body.result}, message: ${body.message}, time spent ${now() - request.paymentStartedAt} ms")
 
                 // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
                 // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
@@ -176,6 +215,9 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         } catch (e: Exception) {
+            val responseTime = now() - requestStartTime
+            metricsService.recordExternalSystemResponseTime(accountName, responseTime)
+            
             when (e) {
                 is SocketTimeoutException -> {
                     logger.error(
