@@ -111,7 +111,7 @@ class PaymentExternalSystemAdapterImpl(
             // requestAverageProcessingTime.toMillis() == to wait already sended requests
             // (requestQueue.size + 1 + effectiveRps) / effectiveRps == to process queue with current request added
             // ceil is needed because we need 2s to process 12 requests with 11rps (11 requests in first sec + 1 request in second sec)
-            val timeNeededToProcessQueueWithNewRequest = ceil(requestQueue.size.toDouble() / effectiveRps).toLong() * 1000 + requestAverageProcessingTime.toMillis() // in milliseconds
+            val timeNeededToProcessQueueWithNewRequest = ceil((requestQueue.size.toDouble() + 1) / effectiveRps).toLong() * 1000 + requestAverageProcessingTime.toMillis() // in milliseconds
 
             if (timeRemaining <= 0 || timeNeededToProcessQueueWithNewRequest + 100 > timeRemaining) {
                 lastRetryAfterTimestamp = currentTime + timeNeededToProcessQueueWithNewRequest
