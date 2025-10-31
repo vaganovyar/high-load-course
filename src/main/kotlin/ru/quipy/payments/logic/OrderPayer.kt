@@ -21,12 +21,7 @@ class OrderPayer {
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
 
-        try {
-            paymentService.submitPaymentRequest(orderId, paymentId, amount, createdAt, deadline)
-        } catch (e: TooManyRequestsException) {
-            logger.warn("Too many requests for payment $paymentId, rejecting with 429")
-            throw e
-        }
+        paymentService.submitPaymentRequest(orderId, paymentId, amount, createdAt, deadline)
         
         return createdAt
     }

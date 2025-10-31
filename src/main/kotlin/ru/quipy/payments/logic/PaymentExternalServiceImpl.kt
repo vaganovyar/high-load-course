@@ -95,7 +95,7 @@ class PaymentExternalSystemAdapterImpl(
         if (timeRemaining <= 0 || timeNeededToProcessQueue > timeRemaining) {
             val retryAfterTimestamp = now() + timeNeededToProcessQueue
 
-            logger.warn("[$accountName] TooManyRequestsException for paymemt $paymentId, retry-after time $retryAfterTimestamp ms")
+            logger.warn("[$accountName] TooManyRequestsException for paymemt $paymentId, retry-after time $retryAfterTimestamp ms, queue size ${requestQueue.size}, time needed $timeNeededToProcessQueue")
             throw TooManyRequestsException("Too many requests", retryAfterTimestamp)
         }
 
@@ -109,8 +109,7 @@ class PaymentExternalSystemAdapterImpl(
 
         val request = PaymentRequest(paymentId, amount, paymentStartedAt, deadline, transactionId)
         requestQueue.offer(request)
-        OrderPayer.logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
-        logger.info("[$accountName] Submitted payment request into queue $paymentId, time spent ${now() - paymentStartedAt} ms")
+        logger.info("[$accountName] Submitted payment request into queue $paymentId, time spent ${now() - paymentStartedAt} ms, queue size ${requestQueue.size}, time needed $timeNeededToProcessQueue")
     }
 
     private suspend fun processRequestQueue() {

@@ -28,7 +28,6 @@ class PaymentSystemImpl(
                 account.performPaymentAsync(paymentId, orderId, amount, paymentStartedAt, deadline)
                 return
             } catch (e: TooManyRequestsException) {
-                logger.warn("Account ${account.name()} rejected payment $paymentId due to back pressure")
                 // Keep the earliest retry timestamp
                 e.retryAfterTimestamp?.let { timestamp ->
                     if (bestRetryAfterTimestamp == null || timestamp < bestRetryAfterTimestamp!!) {
