@@ -110,12 +110,11 @@ class PaymentExternalSystemAdapterImpl(
             // ceil is needed because we need 2s to process 12 requests with 11rps (11 requests in first sec + 1 request in second sec)
             val timeNeededToProcessQueueWithNewRequest = (requestQueue.size + effectiveRps) / effectiveRps * 1000 + requestAverageProcessingTime.toMillis() // in milliseconds
 
-            if (timeRemaining <= 0 || timeNeededToProcessQueueWithNewRequest > timeRemaining) {
-                val retryAfterTimestamp = currentTime + timeNeededToProcessQueueWithNewRequest
-                lastRetryAfterTimestamp = retryAfterTimestamp
+            if (timeRemaining <= 0 || timeNeededToProcessQueueWithNewRequest + 300 > timeRemaining) {
+                lastRetryAfterTimestamp = currentTime + timeNeededToProcessQueueWithNewRequest
 
-                logger.warn("[$accountName] TooManyRequestsException for paymemt $paymentId, retry-after time $retryAfterTimestamp ms, queue size ${requestQueue.size}, time needed $timeNeededToProcessQueueWithNewRequest")
-                throw TooManyRequestsException("Too many requests", retryAfterTimestamp)
+                logger.warn("[$accountName] TooManyRequestsException for paymemt $paymentId, retry-after time $lastRetryAfterTimestamp ms, queue size ${requestQueue.size}, time needed $timeNeededToProcessQueueWithNewRequest")
+                throw TooManyRequestsException("Too many requests", lastRetryAfterTimestamp)
             }
 
             val createdEvent = paymentESService.create {
@@ -136,6 +135,10 @@ class PaymentExternalSystemAdapterImpl(
         while (true) {
             try {
                 val request = requestQueue.take()
+
+                if (now() + requestAverageProcessingTime.toMillis() > request.deadline) {
+                    continue
+                }
 
                 requestSemaphore.withPermit {
                     withContext(Dispatchers.IO) {
