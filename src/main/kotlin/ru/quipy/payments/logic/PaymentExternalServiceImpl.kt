@@ -19,12 +19,14 @@ import java.util.*
 import java.util.concurrent.BlockingQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
+import kotlin.math.ceil
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.toJavaDuration
 
 data class PaymentRequest(
     val paymentId: UUID,
+    val orderId: UUID,
     val amount: Int,
     val paymentStartedAt: Long,
     val deadline: Long,
@@ -48,6 +50,27 @@ class PaymentExternalSystemAdapterImpl(
         val mapper = ObjectMapper().registerKotlinModule()
 
         private const val TASK_NAME = "paymentTask"
+
+        val retryForbiddenCodes = hashSetOf(
+            // 4xx - клиентские ошибки (бессмысленно ретраить)
+            400, // Bad Request - ошибка в запросе
+            401, // Unauthorized - нужна аутентификация
+            403, // Forbidden - доступ запрещен
+            404, // Not Found - ресурс не найден
+            405, // Method Not Allowed - метод не поддерживается
+            409, // Conflict - конфликт состояний
+            410, // Gone - ресурс удален
+            422, // Unprocessable Entity - семантическая ошибка
+
+            // 429 - Too Many Requests (ретраить нельзя - усугубит)
+            429,
+
+            // 5xx - некоторые серверные ошибки (бессмысленно ретраить)
+            501, // Not Implemented - функционал не реализован
+            502, // Bad Gateway - проблемы прокси
+            503, // Service Unavailable - сервис недоступен
+            504  // Gateway Timeout - таймаут шлюза
+        )
     }
 
     private val serviceName = properties.serviceName
@@ -71,6 +94,7 @@ class PaymentExternalSystemAdapterImpl(
     private var lastRetryAfterTimestamp: Long? = null
 
     private val queueLock = Any()
+    private val retriedPayments = Collections.synchronizedSet(HashSet<UUID>())
 
     init {
         metricsService.registerQueueSizeGauge(accountName, this) { requestQueue.size.toDouble() }
@@ -100,15 +124,15 @@ class PaymentExternalSystemAdapterImpl(
             }
 
             val transactionId = UUID.randomUUID()
-            val maxRpsFromConcurrency = maxConcurrentRequests / requestAverageProcessingTime.seconds
-            val effectiveRps = minOf(maxRpsFromConcurrency, rateLimitPerSec.toLong())
+            val maxRpsFromConcurrency = maxConcurrentRequests.toDouble() / requestAverageProcessingTime.toMillis().toDouble() * 1000
+            val effectiveRps = minOf(maxRpsFromConcurrency, rateLimitPerSec.toDouble())
 
             val timeRemaining = deadline - currentTime
 
             // requestAverageProcessingTime.toMillis() == to wait already sended requests
             // (requestQueue.size + 1 + effectiveRps) / effectiveRps == to process queue with current request added
             // ceil is needed because we need 2s to process 12 requests with 11rps (11 requests in first sec + 1 request in second sec)
-            val timeNeededToProcessQueueWithNewRequest = (requestQueue.size + effectiveRps) / effectiveRps * 1000 + requestAverageProcessingTime.toMillis() // in milliseconds
+            val timeNeededToProcessQueueWithNewRequest = ceil((requestQueue.size.toDouble() + 1) / effectiveRps).toLong() * 1000 + requestAverageProcessingTime.toMillis() // in milliseconds
 
             if (timeRemaining <= 0 || timeNeededToProcessQueueWithNewRequest + 100 > timeRemaining) {
                 lastRetryAfterTimestamp = currentTime + timeNeededToProcessQueueWithNewRequest
@@ -117,15 +141,17 @@ class PaymentExternalSystemAdapterImpl(
                 throw TooManyRequestsException("Too many requests", lastRetryAfterTimestamp)
             }
 
-            val createdEvent = paymentESService.create {
-                it.create(
-                    paymentId,
-                    orderId,
-                    amount
-                )
+            if (!retriedPayments.contains(paymentId)) {
+                val createdEvent = paymentESService.create {
+                    it.create(
+                        paymentId,
+                        orderId,
+                        amount
+                    )
+                }
             }
 
-            val request = PaymentRequest(paymentId, amount, paymentStartedAt, deadline, transactionId)
+            val request = PaymentRequest(paymentId, orderId, amount, paymentStartedAt, deadline, transactionId)
             requestQueue.offer(request)
             logger.info("[$accountName] Submitted payment request into queue $paymentId, time spent ${currentTime - paymentStartedAt} ms, queue size ${requestQueue.size}, time needed $timeNeededToProcessQueueWithNewRequest")
         }
@@ -204,13 +230,28 @@ class PaymentExternalSystemAdapterImpl(
                     )
                 }
 
-                logger.info("[$accountName] Payment processed for txId: ${request.transactionId}, payment: ${request.paymentId}, succeeded: ${body.result}, message: ${body.message}, time spent ${now() - request.paymentStartedAt} ms")
+                logger.info("[$accountName] Payment processed for txId: ${request.transactionId}, payment: ${request.paymentId}, succeeded: ${body.result}, result code: ${resp.code}, message: ${body.message}, time spent ${now() - request.paymentStartedAt} ms")
 
                 // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
                 // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
                 withContext(Dispatchers.IO) {
                     paymentESService.update(request.paymentId) {
                         it.logProcessing(body.result, now(), request.transactionId, reason = body.message)
+                    }
+                }
+                
+                // Если это был ретрай, удаляем payment из HashSet
+                if (retriedPayments.contains(request.paymentId)) {
+                    retriedPayments.remove(request.paymentId)
+                } else if (!body.result && !retryForbiddenCodes.contains(resp.code)) {
+                    // Если результат неуспешный и для этого payment еще не было ретрая, пробуем сделать ретрай
+                    retriedPayments.add(request.paymentId)
+                    try {
+                        performPaymentAsync(request.paymentId, request.orderId, request.amount, request.paymentStartedAt, request.deadline)
+                        logger.info("[$accountName] Retry submitted for payment ${request.paymentId}, txId: ${request.transactionId}")
+                    } catch (e: Exception) {
+                        retriedPayments.remove(request.paymentId)
+                        logger.warn("[$accountName] Retry failed for payment ${request.paymentId}, txId: ${request.transactionId}", e)
                     }
                 }
             }
