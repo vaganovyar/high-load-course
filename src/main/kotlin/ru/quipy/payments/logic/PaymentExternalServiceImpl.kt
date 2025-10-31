@@ -50,6 +50,27 @@ class PaymentExternalSystemAdapterImpl(
         val mapper = ObjectMapper().registerKotlinModule()
 
         private const val TASK_NAME = "paymentTask"
+
+        val retryForbiddenCodes = hashSetOf(
+            // 4xx - клиентские ошибки (бессмысленно ретраить)
+            400, // Bad Request - ошибка в запросе
+            401, // Unauthorized - нужна аутентификация
+            403, // Forbidden - доступ запрещен
+            404, // Not Found - ресурс не найден
+            405, // Method Not Allowed - метод не поддерживается
+            409, // Conflict - конфликт состояний
+            410, // Gone - ресурс удален
+            422, // Unprocessable Entity - семантическая ошибка
+
+            // 429 - Too Many Requests (ретраить нельзя - усугубит)
+            429,
+
+            // 5xx - некоторые серверные ошибки (бессмысленно ретраить)
+            501, // Not Implemented - функционал не реализован
+            502, // Bad Gateway - проблемы прокси
+            503, // Service Unavailable - сервис недоступен
+            504  // Gateway Timeout - таймаут шлюза
+        )
     }
 
     private val serviceName = properties.serviceName
@@ -222,7 +243,7 @@ class PaymentExternalSystemAdapterImpl(
                 // Если это был ретрай, удаляем payment из HashSet
                 if (retriedPayments.contains(request.paymentId)) {
                     retriedPayments.remove(request.paymentId)
-                } else if (!body.result) {
+                } else if (!body.result && !retryForbiddenCodes.contains(resp.code)) {
                     // Если результат неуспешный и для этого payment еще не было ретрая, пробуем сделать ретрай
                     retriedPayments.add(request.paymentId)
                     try {
