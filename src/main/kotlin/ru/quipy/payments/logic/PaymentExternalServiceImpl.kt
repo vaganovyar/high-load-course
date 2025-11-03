@@ -8,30 +8,23 @@ import kotlinx.coroutines.sync.withPermit
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import okio.withLock
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
+import ru.quipy.config.RetriesConfig
 import ru.quipy.config.ThreadPoolsConfig
 import ru.quipy.core.EventSourcingService
 import ru.quipy.metrics.MetricsService
 import ru.quipy.payments.api.PaymentAggregate
-import java.net.SocketTimeoutException
+import java.io.InterruptedIOException
 import java.util.*
-import java.util.concurrent.BlockingQueue
 import java.util.concurrent.Executors
-import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.locks.ReentrantLock
 import kotlin.math.ceil
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.toJavaDuration
-
-data class PaymentRequest(
-    val paymentId: UUID,
-    val orderId: UUID,
-    val amount: Int,
-    val paymentStartedAt: Long,
-    val deadline: Long,
-    val transactionId: UUID
-)
 
 // Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
@@ -40,7 +33,8 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentProviderHostPort: String,
     private val token: String,
     private val threadPoolsConfig: ThreadPoolsConfig,
-    private val metricsService: MetricsService
+    private val metricsService: MetricsService,
+    private val retriesConfig: RetriesConfig,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -79,9 +73,9 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder().callTimeout(requestAverageProcessingTime).build()
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), 1.seconds.toJavaDuration())
-    private val requestQueue: BlockingQueue<PaymentRequest> = LinkedBlockingQueue()
+    private val requestQueue: PaymentQueue = PaymentQueue(retriesConfig.payment.maxRetries)
 
     private val executorThreadNumber = threadPoolsConfig.paymentExternalServiceThreadPoolConfig.threadsNumber
     private val executorService = Executors.newFixedThreadPool(executorThreadNumber)
@@ -93,8 +87,7 @@ class PaymentExternalSystemAdapterImpl(
     @Volatile
     private var lastRetryAfterTimestamp: Long? = null
 
-    private val queueLock = Any()
-    private val retriedPayments = Collections.synchronizedSet(HashSet<UUID>())
+    private val queueLock = ReentrantLock()
 
     init {
         metricsService.registerQueueSizeGauge(accountName, this) { requestQueue.size.toDouble() }
@@ -113,7 +106,7 @@ class PaymentExternalSystemAdapterImpl(
         paymentStartedAt: Long,
         deadline: Long
     ) { 
-        synchronized(queueLock) {
+        queueLock.withLock {
             val currentTime = now()
 
             lastRetryAfterTimestamp?.let { retryAfter ->
@@ -141,7 +134,7 @@ class PaymentExternalSystemAdapterImpl(
                 throw TooManyRequestsException("Too many requests", lastRetryAfterTimestamp)
             }
 
-            if (!retriedPayments.contains(paymentId)) {
+            if (!requestQueue.containsByPaymentId(paymentId)) {
                 val createdEvent = paymentESService.create {
                     it.create(
                         paymentId,
@@ -211,13 +204,25 @@ class PaymentExternalSystemAdapterImpl(
 
         val requestStartTime = now()
         try {
-            val response = withContext(Dispatchers.IO) {
-                client.newCall(httpRequest).execute()
+            val response: Response? = withContext(Dispatchers.IO) {
+                try {
+                    client.newCall(httpRequest).execute()
+                } catch (e: Exception) {
+                    when (e) {
+                        is InterruptedIOException -> {
+                            logger.info("[$accountName] Payment timeout for txId: ${request.transactionId}, payment: ${request.paymentId}, time spent ${requestAverageProcessingTime.toMillis()} ms")
+                            val newRequest = request.copy(retries = request.retries + 1)
+                            requestQueue.offer(newRequest)
+                            null
+                        }
+                        else -> throw e
+                    }
+                }
             }
             val responseTime = now() - requestStartTime
             metricsService.recordExternalSystemResponseTime(accountName, responseTime)
 
-            response.use { resp ->
+            response?.let { resp ->
                 val body = try {
                     mapper.readValue(resp.body?.string(), ExternalSysResponse::class.java)
                 } catch (e: Exception) {
@@ -229,6 +234,7 @@ class PaymentExternalSystemAdapterImpl(
                         e.message
                     )
                 }
+                metricsService.registerExternalSystemRetries(accountName, request.retries)
 
                 logger.info("[$accountName] Payment processed for txId: ${request.transactionId}, payment: ${request.paymentId}, succeeded: ${body.result}, result code: ${resp.code}, message: ${body.message}, time spent ${now() - request.paymentStartedAt} ms")
 
@@ -239,39 +245,12 @@ class PaymentExternalSystemAdapterImpl(
                         it.logProcessing(body.result, now(), request.transactionId, reason = body.message)
                     }
                 }
-                
-                // Если это был ретрай, удаляем payment из HashSet
-                if (retriedPayments.contains(request.paymentId)) {
-                    retriedPayments.remove(request.paymentId)
-                } else if (!body.result && !retryForbiddenCodes.contains(resp.code)) {
-                    // Если результат неуспешный и для этого payment еще не было ретрая, пробуем сделать ретрай
-                    retriedPayments.add(request.paymentId)
-                    try {
-                        performPaymentAsync(request.paymentId, request.orderId, request.amount, request.paymentStartedAt, request.deadline)
-                        logger.info("[$accountName] Retry submitted for payment ${request.paymentId}, txId: ${request.transactionId}")
-                    } catch (e: Exception) {
-                        retriedPayments.remove(request.paymentId)
-                        logger.warn("[$accountName] Retry failed for payment ${request.paymentId}, txId: ${request.transactionId}", e)
-                    }
-                }
             }
         } catch (e: Exception) {
             val responseTime = now() - requestStartTime
             metricsService.recordExternalSystemResponseTime(accountName, responseTime)
             
             when (e) {
-                is SocketTimeoutException -> {
-                    logger.error(
-                        "[$accountName] Payment timeout for txId: ${request.transactionId}, payment: ${request.paymentId}, time spent ${now() - request.paymentStartedAt} ms",
-                        e
-                    )
-                    withContext(Dispatchers.IO) {
-                        paymentESService.update(request.paymentId) {
-                            it.logProcessing(false, now(), request.transactionId, reason = "Request timeout.")
-                        }
-                    }
-                }
-
                 else -> {
                     logger.error(
                         "[$accountName] Payment failed for txId: ${request.transactionId}, payment: ${request.paymentId}, time spent ${now() - request.paymentStartedAt} ms",
