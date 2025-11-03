@@ -67,14 +67,21 @@ metrics:
   queue-size:
     name: payment_queue_size
     description: "payment queue size"
-    tags:
-      - account
   external-system-response-time:
     name: external_system_response_time
     description: "external system response time in milliseconds"
+    quantiles: 0.5, 0.75, 0.9, 0.95, 0.99
+  external-system-single-payment-retries:
+    name: external_system_single_payment_retries
+    description: "external system calls for one payment before succesfull response"
     tags:
       - account
+      - retries_count
 
 thread-pools:
   payment-external-service-thread-pool-config:
     threads-number: 16
+
+retries:
+  payment:
+    max-retries: 5
