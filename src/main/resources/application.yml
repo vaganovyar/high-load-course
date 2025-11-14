@@ -42,7 +42,7 @@ event:
 
 payment:
   hostPort: ${PAYMENT_HOST:localhost}:${PAYMENT_PORT:1234}
-  accounts: ${PAYMENT_ACCOUNTS:acc-12,acc-20}
+  accounts: ${PAYMENT_ACCOUNTS:acc-9}
   token: ${PAYMENT_TOKEN}
   service-name: ${PAYMENT_SERVICE_NAME}
 
@@ -80,7 +80,7 @@ metrics:
 
 thread-pools:
   payment-external-service-thread-pool-config:
-    threads-number: 16
+    threads-number: 50
 
 retries:
   payment:
