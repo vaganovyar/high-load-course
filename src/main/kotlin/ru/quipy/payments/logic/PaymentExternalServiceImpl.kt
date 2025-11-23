@@ -65,7 +65,6 @@ class PaymentExternalSystemAdapterImpl(
     private val client = HttpClient(CIO) {
         install(HttpTimeout) {
             requestTimeoutMillis = requestAverageProcessingTime.multipliedBy(2).toMillis()
-            connectTimeoutMillis = requestAverageProcessingTime.multipliedBy(2).toMillis()
             socketTimeoutMillis = requestAverageProcessingTime.multipliedBy(2).toMillis()
         }
         install(ContentNegotiation) {
@@ -76,10 +75,13 @@ class PaymentExternalSystemAdapterImpl(
             endpoint {
                 maxConnectionsPerRoute = maxParallelRequestsCount
                 connectTimeout = requestAverageProcessingTime.multipliedBy(2).toMillis()
+                socketTimeout = requestAverageProcessingTime.multipliedBy(2).toMillis()
                 keepAliveTime = 300_000
                 connectAttempts = 3
+                pipelining = true
                 pipelineMaxSize = 20
             }
+            threadsCount = 16
         }
     }
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), 1.seconds.toJavaDuration())
