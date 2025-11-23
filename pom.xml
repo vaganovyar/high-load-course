@@ -19,6 +19,7 @@
         <kotlin.version>2.1.0</kotlin.version>
         <kotlinx-coroutines-core.version>1.9.0</kotlinx-coroutines-core.version>
         <okhttp.version>4.12.0</okhttp.version>
+        <ktor.version>2.3.12</ktor.version>
         <tiny.es.version>2.7.5</tiny.es.version>
         <resilience4jVersion>2.2.0</resilience4jVersion>
         <json-datatype.version>2.9.8</json-datatype.version>
@@ -44,6 +45,26 @@
             <groupId>com.squareup.okhttp3</groupId>
             <artifactId>okhttp</artifactId>
             <version>${okhttp.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.ktor</groupId>
+            <artifactId>ktor-client-core-jvm</artifactId>
+            <version>${ktor.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.ktor</groupId>
+            <artifactId>ktor-client-cio-jvm</artifactId>
+            <version>${ktor.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.ktor</groupId>
+            <artifactId>ktor-client-content-negotiation-jvm</artifactId>
+            <version>${ktor.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.ktor</groupId>
+            <artifactId>ktor-serialization-jackson-jvm</artifactId>
+            <version>${ktor.version}</version>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>

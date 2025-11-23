@@ -2,15 +2,17 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.ktor.client.*
+import io.ktor.client.engine.cio.*
+import io.ktor.client.plugins.*
+import io.ktor.client.plugins.contentnegotiation.*
+import io.ktor.client.request.*
+import io.ktor.client.statement.*
+import io.ktor.http.*
+import io.ktor.serialization.jackson.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
-import okhttp3.Dispatcher
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.Response
-import okio.withLock
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.config.LogConfig
@@ -19,16 +21,11 @@ import ru.quipy.config.ThreadPoolsConfig
 import ru.quipy.core.EventSourcingService
 import ru.quipy.metrics.MetricsService
 import ru.quipy.payments.api.PaymentAggregate
-import java.io.InterruptedIOException
 import java.util.*
 import java.util.concurrent.Executors
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.locks.ReentrantLock
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 import kotlin.math.absoluteValue
-import kotlin.math.ceil
-import kotlin.math.floor
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.toJavaDuration
@@ -48,7 +45,6 @@ class PaymentExternalSystemAdapterImpl(
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
 
-        val emptyBody = ByteArray(0).toRequestBody(null)
         val mapper = ObjectMapper().registerKotlinModule()
 
         private const val TASK_NAME = "paymentTask"
@@ -64,16 +60,24 @@ class PaymentExternalSystemAdapterImpl(
         maxOf(parallelRequests, rateLimitPerSec * maxOf(1, requestAverageProcessingTime.toSeconds().toInt()))
 
 
-    private val client = OkHttpClient.Builder()
-        .callTimeout(requestAverageProcessingTime.multipliedBy(2))
-        .readTimeout(requestAverageProcessingTime.multipliedBy(2))
-        .connectTimeout(requestAverageProcessingTime.multipliedBy(2))
-        .writeTimeout(requestAverageProcessingTime.multipliedBy(2))
-        .dispatcher(Dispatcher().apply {
-            maxRequests = maxParallelRequestsCount
-            maxRequestsPerHost = maxParallelRequestsCount
-        })
-        .build()
+    private val client = HttpClient(CIO) {
+        install(HttpTimeout) {
+            requestTimeoutMillis = requestAverageProcessingTime.multipliedBy(2).toMillis()
+            connectTimeoutMillis = requestAverageProcessingTime.multipliedBy(2).toMillis()
+            socketTimeoutMillis = requestAverageProcessingTime.multipliedBy(2).toMillis()
+        }
+        install(ContentNegotiation) {
+            jackson()
+        }
+        engine {
+            maxConnectionsCount = maxParallelRequestsCount
+            endpoint {
+                maxConnectionsPerRoute = maxParallelRequestsCount
+                connectTimeout = requestAverageProcessingTime.multipliedBy(2).toMillis()
+                keepAliveTime = 30_000
+            }
+        }
+    }
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), 1.seconds.toJavaDuration())
     private val requestQueue: PaymentChannel = PaymentChannel(retriesConfig.payment.maxRetries)
 
@@ -170,24 +174,20 @@ class PaymentExternalSystemAdapterImpl(
             }
         }
 
-        val httpRequest = Request.Builder().run {
-            url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=${request.transactionId}&paymentId=${request.paymentId}&amount=${request.amount}")
-            post(emptyBody)
-        }.build()
+        val url = "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=${request.transactionId}&paymentId=${request.paymentId}&amount=${request.amount}"
 
         val requestStartTime = now()
         try {
-            val response: Response? =
+            val response: HttpResponse? =
                 try {
-                    val call = client.newCall(httpRequest)
                     log(
                         request.paymentId,
                         "[$accountName] Submit: ${request.paymentId} , txId: ${request.transactionId}, time spent ${now() - request.paymentStartedAt} ms"
                     )
-                    call.await()
+                    client.post(url)
                 } catch (e: Exception) {
                     when (e) {
-                        is InterruptedIOException, is TimeoutCancellationException -> {
+                        is HttpRequestTimeoutException, is TimeoutCancellationException -> {
                             log(
                                 request.paymentId,
                                 "[$accountName] Payment timeout for txId: ${request.transactionId}, payment: ${request.paymentId}, time spent ${requestAverageProcessingTime.toMillis()} ms",
@@ -207,14 +207,12 @@ class PaymentExternalSystemAdapterImpl(
             response?.let { resp ->
                 val body =
                     try {
-                        val bodyString = withContext(Dispatchers.IO) {
-                            resp.body?.string()
-                        }
+                        val bodyString = resp.bodyAsText()
                         mapper.readValue(bodyString, ExternalSysResponse::class.java)
                     } catch (e: Exception) {
                         log(
                             request.paymentId,
-                            "[$accountName] [ERROR] Payment processed for txId: ${request.transactionId}, payment: ${request.paymentId}, result code: ${resp.code}, reason: ${resp.body?.string()}"
+                            "[$accountName] [ERROR] Payment processed for txId: ${request.transactionId}, payment: ${request.paymentId}, result code: ${resp.status.value}, reason: ${e.message}"
                         )
                         ExternalSysResponse(
                             request.transactionId.toString(),
@@ -222,8 +220,6 @@ class PaymentExternalSystemAdapterImpl(
                             false,
                             e.message
                         )
-                    } finally {
-                        resp.close()
                     }
                 backgroundExecutorService.submit {
                     metricsService.registerExternalSystemRetries(accountName, request.retries)
@@ -231,7 +227,7 @@ class PaymentExternalSystemAdapterImpl(
 
                 log(
                     request.paymentId,
-                    "[$accountName] Payment processed for txId: ${request.transactionId}, payment: ${request.paymentId}, succeeded: ${body.result}, result code: ${resp.code}, message: ${body.message}, time spent ${now() - request.paymentStartedAt} ms",
+                    "[$accountName] Payment processed for txId: ${request.transactionId}, payment: ${request.paymentId}, succeeded: ${body.result}, result code: ${resp.status.value}, message: ${body.message}, time spent ${now() - request.paymentStartedAt} ms",
                 )
 
                 // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
@@ -280,27 +276,6 @@ class PaymentExternalSystemAdapterImpl(
     private fun err(paymentId: UUID, msg: String, e: Throwable) {
         if (logConfig.enabled && paymentId.hashCode().absoluteValue % logConfig.sample == 0) {
             logger.error(msg, e)
-        }
-    }
-}
-
-private suspend fun okhttp3.Call.await(): Response {
-    return suspendCancellableCoroutine { continuation ->
-        enqueue(object : okhttp3.Callback {
-            override fun onResponse(call: okhttp3.Call, response: Response) {
-                continuation.resume(response)
-            }
-
-            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
-                continuation.resumeWithException(e)
-            }
-        })
-
-        continuation.invokeOnCancellation {
-            try {
-                cancel()
-            } catch (ex: Exception) {
-            }
         }
     }
 }
