@@ -15,6 +15,8 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
+import java.io.IOException
+import java.net.ConnectException
 import ru.quipy.config.LogConfig
 import ru.quipy.config.RetriesConfig
 import ru.quipy.config.ThreadPoolsConfig
@@ -74,7 +76,9 @@ class PaymentExternalSystemAdapterImpl(
             endpoint {
                 maxConnectionsPerRoute = maxParallelRequestsCount
                 connectTimeout = requestAverageProcessingTime.multipliedBy(2).toMillis()
-                keepAliveTime = 30_000
+                keepAliveTime = 300_000
+                connectAttempts = 3
+                pipelineMaxSize = 20
             }
         }
     }
