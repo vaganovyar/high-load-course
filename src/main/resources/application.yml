@@ -8,7 +8,7 @@ spring:
   datasource:
     hikari:
       username: tiny_es
-      jdbc-url: jdbc:postgresql://${POSTGRES_ADDRESS:192.168.64.2}:${POSTGRES_PORT:65432}/postgres
+      jdbc-url: jdbc:postgresql://${POSTGRES_ADDRESS:localhost}:${POSTGRES_PORT:65432}/postgres
       leak-detection-threshold: 2000
       password: tiny_es
   main:
@@ -17,7 +17,7 @@ spring:
   data:
     mongodb:
       port: 27017
-      host: 192.168.64.2
+      host: localhost
       database: online-shop
 
 management:
@@ -41,7 +41,7 @@ event:
     auto-scan-enabled: true
 
 payment:
-  hostPort: ${PAYMENT_HOST:192.168.64.2}:${PAYMENT_PORT:1234}
+  hostPort: ${PAYMENT_HOST:localhost}:${PAYMENT_PORT:1234}
   accounts: ${PAYMENT_ACCOUNTS:acc-12}
   token: ${PAYMENT_TOKEN}
   service-name: ${PAYMENT_SERVICE_NAME}
