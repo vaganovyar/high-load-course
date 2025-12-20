@@ -145,22 +145,22 @@ class PaymentExternalSystemAdapterImpl(
             }
 
             val transactionId = UUID.randomUUID()
-            val maxRpsFromConcurrency = maxConcurrentRequests.toDouble() / requestAverageProcessingTime.toMillis().toDouble() * 1000
-            val effectiveRps = minOf(maxRpsFromConcurrency, rateLimitPerSec.toDouble())
-
-            val timeRemaining = deadline - currentTime
-
-            // requestAverageProcessingTime.toMillis() == to wait already sended requests
-            // (requestQueue.size + 1 + effectiveRps) / effectiveRps == to process queue with current request added
-            // ceil is needed because we need 2s to process 12 requests with 11rps (11 requests in first sec + 1 request in second sec)
-            val timeNeededToProcessQueueWithNewRequest = ceil((requestQueue.size().toDouble() + 1) / effectiveRps).toLong() * 1000 + requestAverageProcessingTime.toMillis() // in milliseconds
-
-            if (timeRemaining <= 0 || timeNeededToProcessQueueWithNewRequest + 100 > timeRemaining) {
-                lastRetryAfterTimestamp = currentTime + timeNeededToProcessQueueWithNewRequest
-
-                logger.warn("[$accountName] TooManyRequestsException for paymemt $paymentId, retry-after time $lastRetryAfterTimestamp ms, queue size ${requestQueue.size()}, time needed $timeNeededToProcessQueueWithNewRequest")
-                throw TooManyRequestsException("Too many requests", lastRetryAfterTimestamp)
-            }
+//            val maxRpsFromConcurrency = maxConcurrentRequests.toDouble() / requestAverageProcessingTime.toMillis().toDouble() * 1000
+//            val effectiveRps = minOf(maxRpsFromConcurrency, rateLimitPerSec.toDouble())
+//
+//            val timeRemaining = deadline - currentTime
+//
+//            // requestAverageProcessingTime.toMillis() == to wait already sended requests
+//            // (requestQueue.size + 1 + effectiveRps) / effectiveRps == to process queue with current request added
+//            // ceil is needed because we need 2s to process 12 requests with 11rps (11 requests in first sec + 1 request in second sec)
+//            val timeNeededToProcessQueueWithNewRequest = ceil((requestQueue.size().toDouble() + 1) / effectiveRps).toLong() * 1000 + requestAverageProcessingTime.toMillis() // in milliseconds
+//
+//            if (timeRemaining <= 0 || timeNeededToProcessQueueWithNewRequest + 100 > timeRemaining) {
+//                lastRetryAfterTimestamp = currentTime + timeNeededToProcessQueueWithNewRequest
+//
+//                logger.warn("[$accountName] TooManyRequestsException for paymemt $paymentId, retry-after time $lastRetryAfterTimestamp ms, queue size ${requestQueue.size()}, time needed $timeNeededToProcessQueueWithNewRequest")
+//                throw TooManyRequestsException("Too many requests", lastRetryAfterTimestamp)
+//            }
 
             paymentESService.create {
                 it.create(
