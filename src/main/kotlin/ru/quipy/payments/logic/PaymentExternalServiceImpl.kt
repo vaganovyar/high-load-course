@@ -134,17 +134,16 @@ class PaymentExternalSystemAdapterImpl(
         paymentStartedAt: Long,
         deadline: Long
     ) {
-        queueLock.withLock {
-            var currentTime = now()
+        var currentTime = now()
 
-            lastRetryAfterTimestamp?.let { retryAfter ->
-                if (currentTime < retryAfter) {
-                    logger.warn("[$accountName] TooManyRequestsException for payment $paymentId, retry-after time $retryAfter ms (from previous rejection)")
-                    throw TooManyRequestsException("Too many requests", retryAfter)
-                }
-            }
+//        lastRetryAfterTimestamp?.let { retryAfter ->
+//            if (currentTime < retryAfter) {
+//                logger.warn("[$accountName] TooManyRequestsException for payment $paymentId, retry-after time $retryAfter ms (from previous rejection)")
+//                throw TooManyRequestsException("Too many requests", retryAfter)
+//            }
+//        }
 
-            val transactionId = UUID.randomUUID()
+        val transactionId = UUID.randomUUID()
 //            val maxRpsFromConcurrency = maxConcurrentRequests.toDouble() / requestAverageProcessingTime.toMillis().toDouble() * 1000
 //            val effectiveRps = minOf(maxRpsFromConcurrency, rateLimitPerSec.toDouble())
 //
@@ -162,27 +161,26 @@ class PaymentExternalSystemAdapterImpl(
 //                throw TooManyRequestsException("Too many requests", lastRetryAfterTimestamp)
 //            }
 
-            paymentESService.create {
-                it.create(
-                    paymentId,
-                    orderId,
-                    amount
-                )
-            }
-
-            val request = PaymentRequest(paymentId, orderId, amount, paymentStartedAt, deadline, transactionId)
-            runBlocking { requestQueue.offer(request) }
-            log(
+        paymentESService.create {
+            it.create(
                 paymentId,
-                "[$accountName] Submitted payment request into queue $paymentId, time spent ${now() - paymentStartedAt} ms",
+                orderId,
+                amount
             )
-            
-            // Log queue size every second
-            currentTime = now()
-            if (currentTime - lastQueueLogTime >= 1000) {
-                lastQueueLogTime = currentTime
-                logger.info("[$accountName] Queue size: ${requestQueue.size()}, background queue size: ${backgroundExecutorService.queue.size}")
-            }
+        }
+
+        val request = PaymentRequest(paymentId, orderId, amount, paymentStartedAt, deadline, transactionId)
+        runBlocking { requestQueue.offer(request) }
+        log(
+            paymentId,
+            "[$accountName] Submitted payment request into queue $paymentId, time spent ${now() - paymentStartedAt} ms",
+        )
+
+        // Log queue size every second
+        currentTime = now()
+        if (currentTime - lastQueueLogTime >= 1000) {
+            lastQueueLogTime = currentTime
+            logger.info("[$accountName] Queue size: ${requestQueue.size()}, background queue size: ${backgroundExecutorService.queue.size}")
         }
     }
 
