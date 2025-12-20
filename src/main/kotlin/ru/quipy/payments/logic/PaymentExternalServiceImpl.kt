@@ -193,7 +193,6 @@ class PaymentExternalSystemAdapterImpl(
             }
 
             requestSemaphore.withPermit {
-                rateLimiter.tickSuspend()
                 processPaymentRequest(request)
                 // TODO: nice idea but token returns into new window and rate limit is breached for good requests
                 // val currentTime = now()
@@ -227,6 +226,7 @@ class PaymentExternalSystemAdapterImpl(
 
         val url = "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=${request.transactionId}&paymentId=${request.paymentId}&amount=${request.amount}"
 
+        rateLimiter.tickSuspend()
         val requestStartTime = now()
         try {
             val responseData: Pair<String, Int>? =
