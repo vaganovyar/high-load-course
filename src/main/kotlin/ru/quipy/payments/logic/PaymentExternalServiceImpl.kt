@@ -3,16 +3,13 @@ package ru.quipy.payments.logic
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.ktor.client.*
-import io.ktor.client.engine.okhttp.*
+import io.ktor.client.engine.java.*
 import io.ktor.client.plugins.*
 import io.ktor.client.plugins.contentnegotiation.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.serialization.jackson.*
-import okhttp3.ConnectionPool
-import okhttp3.Dispatcher
-import okhttp3.Protocol
-import java.util.concurrent.TimeUnit
+import java.net.http.HttpClient as JavaHttpClient
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -88,7 +85,7 @@ class PaymentExternalSystemAdapterImpl(
         maxOf(parallelRequests, rateLimitPerSec * maxOf(1, requestAverageProcessingTime.toSeconds().toInt()))
 
 
-    private val client = HttpClient(OkHttp) {
+    private val client = HttpClient(Java) {
         install(HttpTimeout) {
             requestTimeoutMillis = requestAverageProcessingTime.multipliedBy(2).toMillis()
             socketTimeoutMillis = requestAverageProcessingTime.multipliedBy(2).toMillis()
@@ -97,27 +94,8 @@ class PaymentExternalSystemAdapterImpl(
             jackson()
         }
         engine {
-            config {
-                protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE))
-                
-                val dispatcher = Dispatcher().apply {
-                    maxRequests = maxParallelRequestsCount
-                    maxRequestsPerHost = maxParallelRequestsCount
-                }
-                dispatcher(dispatcher)
-                
-                connectionPool(ConnectionPool(
-                    maxIdleConnections = 50,
-                    keepAliveDuration = 5,
-                    timeUnit = TimeUnit.MINUTES
-                ))
-                
-                connectTimeout(requestAverageProcessingTime.multipliedBy(2).toMillis(), TimeUnit.MILLISECONDS)
-                readTimeout(requestAverageProcessingTime.multipliedBy(2).toMillis(), TimeUnit.MILLISECONDS)
-                writeTimeout(requestAverageProcessingTime.multipliedBy(2).toMillis(), TimeUnit.MILLISECONDS)
-                
-                retryOnConnectionFailure(false)
-            }
+            protocolVersion = JavaHttpClient.Version.HTTP_2
+            threadsCount = 16
         }
         expectSuccess = false
     }
