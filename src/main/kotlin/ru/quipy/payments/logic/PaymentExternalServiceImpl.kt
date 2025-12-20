@@ -2,21 +2,25 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import io.ktor.client.*
-import io.ktor.client.engine.java.*
-import io.ktor.client.plugins.*
-import io.ktor.client.plugins.contentnegotiation.*
-import io.ktor.client.request.*
-import io.ktor.client.statement.*
-import io.ktor.serialization.jackson.*
-import java.net.http.HttpClient as JavaHttpClient
 import kotlinx.coroutines.*
+import kotlinx.coroutines.reactor.awaitSingle
+import kotlinx.coroutines.reactor.awaitSingleOrNull
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import org.slf4j.LoggerFactory
+import org.springframework.http.HttpStatus
+import org.springframework.http.client.reactive.ReactorClientHttpConnector
+import org.springframework.web.reactive.function.client.WebClient
+import org.springframework.web.reactive.function.client.WebClientRequestException
+import org.springframework.web.reactive.function.client.WebClientResponseException
+import org.springframework.web.reactive.function.client.awaitBody
+import reactor.netty.http.client.HttpClient
+import reactor.netty.http.HttpProtocol
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import java.io.IOException
 import java.net.ConnectException
+import java.time.Duration
+import java.util.concurrent.TimeoutException
 import ru.quipy.config.LogConfig
 import ru.quipy.config.RetriesConfig
 import ru.quipy.config.ThreadPoolsConfig
@@ -85,20 +89,13 @@ class PaymentExternalSystemAdapterImpl(
         maxOf(parallelRequests, rateLimitPerSec * maxOf(1, requestAverageProcessingTime.toSeconds().toInt()))
 
 
-    private val client = HttpClient(Java) {
-        install(HttpTimeout) {
-            requestTimeoutMillis = requestAverageProcessingTime.multipliedBy(2).toMillis()
-            socketTimeoutMillis = requestAverageProcessingTime.multipliedBy(2).toMillis()
-        }
-        install(ContentNegotiation) {
-            jackson()
-        }
-        engine {
-            protocolVersion = JavaHttpClient.Version.HTTP_2
-            threadsCount = 16
-        }
-        expectSuccess = false
-    }
+    private val httpClient = HttpClient.create()
+        .protocol(HttpProtocol.H2C)
+        .responseTimeout(Duration.ofMillis(requestAverageProcessingTime.multipliedBy(2).toMillis()))
+
+    private val webClient = WebClient.builder()
+        .clientConnector(ReactorClientHttpConnector(httpClient))
+        .build()
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), 1.seconds.toJavaDuration())
     private val requestQueue: PaymentChannel = PaymentChannel(retriesConfig.payment.maxRetries)
 
@@ -234,16 +231,22 @@ class PaymentExternalSystemAdapterImpl(
 
         val requestStartTime = now()
         try {
-            val response: HttpResponse? =
+            val responseData: Pair<String, Int>? =
                 try {
                     log(
                         request.paymentId,
                         "[$accountName] Submit: ${request.paymentId} , txId: ${request.transactionId}, time spent ${now() - request.paymentStartedAt} ms"
                     )
-                    client.post(url)
+                    val response = webClient.post()
+                        .uri(url)
+                        .retrieve()
+                        .toEntity(String::class.java)
+                        .awaitSingle()
+                    
+                    Pair(response.body ?: "", response.statusCode.value())
                 } catch (e: Exception) {
                     when (e) {
-                        is HttpRequestTimeoutException, is TimeoutCancellationException -> {
+                        is TimeoutException, is TimeoutCancellationException -> {
                             log(
                                 request.paymentId,
                                 "[$accountName] Payment timeout for txId: ${request.transactionId}, payment: ${request.paymentId}, time spent ${requestAverageProcessingTime.toMillis()} ms",
@@ -252,7 +255,7 @@ class PaymentExternalSystemAdapterImpl(
                             requestQueue.offer(newRequest)
                             null
                         }
-                        is ConnectException, is IOException -> {
+                        is WebClientRequestException, is ConnectException, is IOException -> {
                             log(
                                 request.paymentId,
                                 "[$accountName] Connection error for txId: ${request.transactionId}, payment: ${request.paymentId}, error: ${e.message}",
@@ -262,22 +265,24 @@ class PaymentExternalSystemAdapterImpl(
                             requestQueue.offer(newRequest)
                             null
                         }
+                        is WebClientResponseException -> {
+                            Pair(e.responseBodyAsString, e.statusCode.value())
+                        }
                         else -> throw e
                     }
                 }
-            response?.let { resp ->
+            responseData?.let { (bodyString, statusCode) ->
                 val responseTime = now() - requestStartTime
                 backgroundExecutorService.submit {
                     metricsService.recordExternalSystemResponseTime(accountName, responseTime)
                 }
                 val body =
                     try {
-                        val bodyString = resp.bodyAsText()
                         mapper.readValue(bodyString, ExternalSysResponse::class.java)
                     } catch (e: Exception) {
                         log(
                             request.paymentId,
-                            "[$accountName] [ERROR] Payment processed for txId: ${request.transactionId}, payment: ${request.paymentId}, result code: ${resp.status.value}, reason: ${e.message}"
+                            "[$accountName] [ERROR] Payment processed for txId: ${request.transactionId}, payment: ${request.paymentId}, result code: $statusCode, reason: ${e.message}"
                         )
                         ExternalSysResponse(
                             request.transactionId.toString(),
@@ -292,7 +297,7 @@ class PaymentExternalSystemAdapterImpl(
 
                 log(
                     request.paymentId,
-                    "[$accountName] Payment processed for txId: ${request.transactionId}, payment: ${request.paymentId}, succeeded: ${body.result}, result code: ${resp.status.value}, message: ${body.message}, time spent ${now() - request.paymentStartedAt} ms",
+                    "[$accountName] Payment processed for txId: ${request.transactionId}, payment: ${request.paymentId}, succeeded: ${body.result}, result code: $statusCode, message: ${body.message}, time spent ${now() - request.paymentStartedAt} ms",
                 )
 
                 // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
