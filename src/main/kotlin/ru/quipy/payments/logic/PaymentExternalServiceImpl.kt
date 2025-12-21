@@ -21,6 +21,7 @@ import java.io.IOException
 import java.net.ConnectException
 import java.time.Duration
 import java.util.concurrent.TimeoutException
+import ru.quipy.config.BackPressureConfig
 import ru.quipy.config.LogConfig
 import ru.quipy.config.RetriesConfig
 import ru.quipy.config.ThreadPoolsConfig
@@ -47,7 +48,8 @@ class PaymentExternalSystemAdapterImpl(
     threadPoolsConfig: ThreadPoolsConfig,
     private val metricsService: MetricsService,
     retriesConfig: RetriesConfig,
-    private val logConfig: LogConfig
+    private val logConfig: LogConfig,
+    private val backPressureConfig: BackPressureConfig
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -106,6 +108,9 @@ class PaymentExternalSystemAdapterImpl(
     private val backgroundExecutorThreadNumber = threadPoolsConfig.paymentExternalServiceThreadPoolConfig.backgroundTaskThreadsNumber
     private val backgroundExecutorService = Executors.newFixedThreadPool(backgroundExecutorThreadNumber) as ThreadPoolExecutor
 
+    private val requestHandlerThreadNumber = threadPoolsConfig.paymentExternalServiceThreadPoolConfig.requestHandlerThreadsNumber
+    private val requestHandlerExecutorService = Executors.newFixedThreadPool(requestHandlerThreadNumber) as ThreadPoolExecutor
+
     private val maxConcurrentRequests: Int = parallelRequests
     private val requestSemaphore = Semaphore(permits = maxConcurrentRequests)
 
@@ -134,53 +139,71 @@ class PaymentExternalSystemAdapterImpl(
         paymentStartedAt: Long,
         deadline: Long
     ) {
-        var currentTime = now()
+        // Light calculations and queue size checks
+        val checkQueueAndDeadline = {
+            var currentTime = now()
 
-//        lastRetryAfterTimestamp?.let { retryAfter ->
-//            if (currentTime < retryAfter) {
-//                logger.warn("[$accountName] TooManyRequestsException for payment $paymentId, retry-after time $retryAfter ms (from previous rejection)")
-//                throw TooManyRequestsException("Too many requests", retryAfter)
-//            }
-//        }
+            lastRetryAfterTimestamp?.let { retryAfter ->
+                if (currentTime < retryAfter) {
+                    logger.warn("[$accountName] TooManyRequestsException for payment $paymentId, retry-after time $retryAfter ms (from previous rejection)")
+                    throw TooManyRequestsException("Too many requests", retryAfter)
+                }
+            }
 
-        val transactionId = UUID.randomUUID()
-//            val maxRpsFromConcurrency = maxConcurrentRequests.toDouble() / requestAverageProcessingTime.toMillis().toDouble() * 1000
-//            val effectiveRps = minOf(maxRpsFromConcurrency, rateLimitPerSec.toDouble())
-//
-//            val timeRemaining = deadline - currentTime
-//
-//            // requestAverageProcessingTime.toMillis() == to wait already sended requests
-//            // (requestQueue.size + 1 + effectiveRps) / effectiveRps == to process queue with current request added
-//            // ceil is needed because we need 2s to process 12 requests with 11rps (11 requests in first sec + 1 request in second sec)
-//            val timeNeededToProcessQueueWithNewRequest = ceil((requestQueue.size().toDouble() + 1) / effectiveRps).toLong() * 1000 + requestAverageProcessingTime.toMillis() // in milliseconds
-//
-//            if (timeRemaining <= 0 || timeNeededToProcessQueueWithNewRequest + 100 > timeRemaining) {
-//                lastRetryAfterTimestamp = currentTime + timeNeededToProcessQueueWithNewRequest
-//
-//                logger.warn("[$accountName] TooManyRequestsException for paymemt $paymentId, retry-after time $lastRetryAfterTimestamp ms, queue size ${requestQueue.size()}, time needed $timeNeededToProcessQueueWithNewRequest")
-//                throw TooManyRequestsException("Too many requests", lastRetryAfterTimestamp)
-//            }
+            val maxRpsFromConcurrency =
+                maxConcurrentRequests.toDouble() / requestAverageProcessingTime.toMillis().toDouble() * 1000
+            val effectiveRps = minOf(maxRpsFromConcurrency, rateLimitPerSec.toDouble())
 
-        paymentESService.create {
-            it.create(
-                paymentId,
-                orderId,
-                amount
-            )
+            val timeRemaining = deadline - currentTime
+
+            // requestAverageProcessingTime.toMillis() == to wait already sended requests
+            // (requestQueue.size + 1 + effectiveRps) / effectiveRps == to process queue with current request added
+            // ceil is needed because we need 2s to process 12 requests with 11rps (11 requests in first sec + 1 request in second sec)
+            val timeNeededToProcessQueueWithNewRequest = ceil(
+                (requestQueue.size().toDouble() + 1) / effectiveRps
+            ).toLong() * 1000 + requestAverageProcessingTime.toMillis() // in milliseconds
+
+            if (timeRemaining <= 0 || timeNeededToProcessQueueWithNewRequest + 100 > timeRemaining) {
+                lastRetryAfterTimestamp = currentTime + timeNeededToProcessQueueWithNewRequest
+
+                logger.warn("[$accountName] TooManyRequestsException for paymemt $paymentId, retry-after time $lastRetryAfterTimestamp ms, queue size ${requestQueue.size()}, time needed $timeNeededToProcessQueueWithNewRequest")
+                throw TooManyRequestsException("Too many requests", lastRetryAfterTimestamp)
+            }
         }
 
-        val request = PaymentRequest(paymentId, orderId, amount, paymentStartedAt, deadline, transactionId)
-        runBlocking { requestQueue.offer(request) }
-        log(
-            paymentId,
-            "[$accountName] Submitted payment request into queue $paymentId, time spent ${now() - paymentStartedAt} ms",
-        )
+        // Execute checks under lock if precise timing is enabled
+        if (backPressureConfig.usePreciseQueueProcessTime) {
+            queueLock.withLock {
+                checkQueueAndDeadline()
+            }
+        } else {
+            checkQueueAndDeadline()
+        }
 
-        // Log queue size every second
-        currentTime = now()
-        if (currentTime - lastQueueLogTime >= 1000) {
-            lastQueueLogTime = currentTime
-            logger.info("[$accountName] Queue size: ${requestQueue.size()}, background queue size: ${backgroundExecutorService.queue.size}")
+        // Heavy operations in separate thread pool
+        requestHandlerExecutorService.submit {
+            paymentESService.create {
+                it.create(
+                    paymentId,
+                    orderId,
+                    amount
+                )
+            }
+
+            val transactionId = UUID.randomUUID()
+            val request = PaymentRequest(paymentId, orderId, amount, paymentStartedAt, deadline, transactionId)
+            runBlocking { requestQueue.offer(request) }
+            log(
+                paymentId,
+                "[$accountName] Submitted payment request into queue $paymentId, time spent ${now() - paymentStartedAt} ms",
+            )
+
+            // Log queue size every second
+            val currentTime = now()
+            if (currentTime - lastQueueLogTime >= 1000) {
+                lastQueueLogTime = currentTime
+                logger.info("[$accountName] Queue size: ${requestQueue.size()}, background queue size: ${backgroundExecutorService.queue.size}, request handler queue size: ${requestHandlerExecutorService.queue.size}")
+            }
         }
     }
 

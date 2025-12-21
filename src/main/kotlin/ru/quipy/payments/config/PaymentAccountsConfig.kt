@@ -6,6 +6,7 @@ import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
+import ru.quipy.config.BackPressureConfig
 import ru.quipy.config.LogConfig
 import ru.quipy.config.RetriesConfig
 import ru.quipy.config.ThreadPoolsConfig
@@ -46,6 +47,7 @@ class PaymentAccountsConfig {
         metricsService: MetricsService,
         retiesConfig: RetriesConfig,
         logConfig: LogConfig,
+        backPressureConfig: BackPressureConfig,
     ): List<PaymentExternalSystemAdapter> {
         val request = HttpRequest.newBuilder()
             .uri(URI("http://${paymentProviderHostPort}/external/accounts?serviceName=$serviceName&token=$token"))
@@ -71,7 +73,8 @@ class PaymentAccountsConfig {
                     threadPoolsConfig,
                     metricsService,
                     retiesConfig,
-                    logConfig
+                    logConfig,
+                    backPressureConfig
                 )
             }
     }

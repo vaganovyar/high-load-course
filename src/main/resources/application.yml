@@ -82,10 +82,14 @@ thread-pools:
   payment-external-service-thread-pool-config:
     threads-number: 128
     background-task-threads-number: 32
+    request-handler-threads-number: 32
 
 retries:
   payment:
     max-retries: 5
+
+back-pressure:
+  use-precise-queue-process-time: false
 
 logging:
   enabled: true

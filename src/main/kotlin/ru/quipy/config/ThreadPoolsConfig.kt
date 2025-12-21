@@ -10,6 +10,7 @@ data class ThreadPoolsConfig(
 ) {
     data class ThreadPoolProperties(
         var threadsNumber: Int = 1,
-        var backgroundTaskThreadsNumber: Int = 1
+        var backgroundTaskThreadsNumber: Int = 1,
+        var requestHandlerThreadsNumber: Int = 32
     )
 }
