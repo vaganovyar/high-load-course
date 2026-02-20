@@ -93,7 +93,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val httpClient = HttpClient.create()
         .protocol(HttpProtocol.H2C)
-        .responseTimeout(Duration.ofMillis(requestAverageProcessingTime.multipliedBy(2).toMillis()))
+        .responseTimeout(Duration.ofMillis(maxOf(requestAverageProcessingTime.multipliedBy(2).toMillis(), 500)))
 
     private val webClient = WebClient.builder()
         .clientConnector(ReactorClientHttpConnector(httpClient))
@@ -118,9 +118,12 @@ class PaymentExternalSystemAdapterImpl(
     private var lastRetryAfterTimestamp: Long? = null
 
     private val queueLock = ReentrantLock()
-    
+
     @Volatile
     private var lastQueueLogTime: Long = 0
+
+    private val timeToProcessCounter =
+        TimeToProcessCounter(requestAverageProcessingTime, maxConcurrentRequests, rateLimitPerSec)
 
     init {
         metricsService.registerQueueSizeGauge(accountName, this) { requestQueue.size().toDouble() }
@@ -150,18 +153,9 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
 
-            val maxRpsFromConcurrency =
-                maxConcurrentRequests.toDouble() / requestAverageProcessingTime.toMillis().toDouble() * 1000
-            val effectiveRps = minOf(maxRpsFromConcurrency, rateLimitPerSec.toDouble())
-
             val timeRemaining = deadline - currentTime
 
-            // requestAverageProcessingTime.toMillis() == to wait already sended requests
-            // (requestQueue.size + 1 + effectiveRps) / effectiveRps == to process queue with current request added
-            // ceil is needed because we need 2s to process 12 requests with 11rps (11 requests in first sec + 1 request in second sec)
-            val timeNeededToProcessQueueWithNewRequest = ceil(
-                (requestQueue.size().toDouble() + 1) / effectiveRps
-            ).toLong() * 1000 + requestAverageProcessingTime.toMillis() // in milliseconds
+            val timeNeededToProcessQueueWithNewRequest = timeToProcessCounter.computeTimeToProcessQueue(requestQueue.size() + 1).toMillis()
 
             if (timeRemaining <= 0 || timeNeededToProcessQueueWithNewRequest + 100 > timeRemaining) {
                 lastRetryAfterTimestamp = currentTime + timeNeededToProcessQueueWithNewRequest
@@ -263,7 +257,7 @@ class PaymentExternalSystemAdapterImpl(
                         .retrieve()
                         .toEntity(String::class.java)
                         .awaitSingle()
-                    
+
                     Pair(response.body ?: "", response.statusCode.value())
                 } catch (e: Exception) {
                     when (e) {
@@ -276,6 +270,7 @@ class PaymentExternalSystemAdapterImpl(
                             requestQueue.offer(newRequest)
                             null
                         }
+
                         is WebClientRequestException, is ConnectException, is IOException -> {
                             log(
                                 request.paymentId,
@@ -286,9 +281,11 @@ class PaymentExternalSystemAdapterImpl(
                             requestQueue.offer(newRequest)
                             null
                         }
+
                         is WebClientResponseException -> {
                             Pair(e.responseBodyAsString, e.statusCode.value())
                         }
+
                         else -> throw e
                     }
                 }
@@ -358,7 +355,7 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun name() = properties.accountName
 
-    private fun log(paymentId: UUID , msg: String) {
+    private fun log(paymentId: UUID, msg: String) {
         if (logConfig.enabled && paymentId.hashCode().absoluteValue % logConfig.sample == 0) {
             logger.info(msg)
         }
