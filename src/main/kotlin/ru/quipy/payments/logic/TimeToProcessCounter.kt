@@ -4,9 +4,9 @@ import org.slf4j.LoggerFactory
 import java.time.Duration
 
 class TimeToProcessCounter(
-    public val requestAverageProcessingTime: Duration,
-    public val maxConcurrentRequests: Int,
-    public val rateLimitPerSec: Int,
+    private val requestAverageProcessingTime: Duration,
+    private val maxConcurrentRequests: Int,
+    private val rateLimitPerSec: Int,
 ) {
     companion object {
         val logger = LoggerFactory.getLogger(TimeToProcessCounter::class.java)
@@ -51,7 +51,7 @@ class TimeToProcessCounter(
         logger.info("Precomputed processing times for requestAverageProcessingTime=$requestAverageProcessingTime, maxConcurrentRequests=$maxConcurrentRequests, rateLimitPerSec=$rateLimitPerSec, first values = [${observations[0]}, ${observations[1]}, ${observations[2]}, ${observations[3]}, ${observations[4]}]")
     }
 
-    public fun computeTimeToProcessQueue(queueSize: Int): Duration {
+    fun computeTimeToProcessQueue(queueSize: Int): Duration {
         val index = observations.binarySearch { it.requestsCount.compareTo(queueSize) }
         val sendTime = if (index >= 0) observations[index].time else observations[-index - 1].time
         return sendTime + requestAverageProcessingTime
