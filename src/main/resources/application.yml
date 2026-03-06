@@ -83,6 +83,8 @@ thread-pools:
     threads-number: 128
     background-task-threads-number: 32
     request-handler-threads-number: 32
+  parallel-idempotency-requests-executor-service-thread-pool-config:
+    threads-number: 128
 
 retries:
   payment:
@@ -94,3 +96,10 @@ back-pressure:
 logging:
   enabled: true
   sample: 100
+
+queue-simulation:
+  enabled: false
+
+hedged-requests:
+  tries: 5
+  delay: 200

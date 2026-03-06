@@ -4,27 +4,21 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import kotlinx.coroutines.*
 import kotlinx.coroutines.reactor.awaitSingle
-import kotlinx.coroutines.reactor.awaitSingleOrNull
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import org.slf4j.LoggerFactory
-import org.springframework.http.HttpStatus
 import org.springframework.http.client.reactive.ReactorClientHttpConnector
 import org.springframework.web.reactive.function.client.WebClient
 import org.springframework.web.reactive.function.client.WebClientRequestException
 import org.springframework.web.reactive.function.client.WebClientResponseException
-import org.springframework.web.reactive.function.client.awaitBody
 import reactor.netty.http.client.HttpClient
 import reactor.netty.http.HttpProtocol
 import ru.quipy.common.utils.SlidingWindowRateLimiter
+import ru.quipy.config.*
 import java.io.IOException
 import java.net.ConnectException
 import java.time.Duration
 import java.util.concurrent.TimeoutException
-import ru.quipy.config.BackPressureConfig
-import ru.quipy.config.LogConfig
-import ru.quipy.config.RetriesConfig
-import ru.quipy.config.ThreadPoolsConfig
 import ru.quipy.core.EventSourcingService
 import ru.quipy.metrics.MetricsService
 import ru.quipy.payments.api.PaymentAggregate
@@ -34,7 +28,6 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.math.absoluteValue
-import kotlin.math.ceil
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.toJavaDuration
@@ -49,7 +42,9 @@ class PaymentExternalSystemAdapterImpl(
     private val metricsService: MetricsService,
     retriesConfig: RetriesConfig,
     private val logConfig: LogConfig,
-    private val backPressureConfig: BackPressureConfig
+    private val backPressureConfig: BackPressureConfig,
+    private val queueSimulationConfig: QueueSimulationConfig,
+    private val hedgedRequestsConfig: HedgedRequestsConfig,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -86,6 +81,7 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
+    private val queueSimulationEnabled = queueSimulationConfig.enabled
 
     private val maxParallelRequestsCount =
         maxOf(parallelRequests, rateLimitPerSec * maxOf(1, requestAverageProcessingTime.toSeconds().toInt()))
@@ -95,10 +91,6 @@ class PaymentExternalSystemAdapterImpl(
         .protocol(HttpProtocol.H2C)
         .responseTimeout(Duration.ofMillis(maxOf(requestAverageProcessingTime.multipliedBy(2).toMillis(), 500)))
 
-    private val webClient = WebClient.builder()
-        .clientConnector(ReactorClientHttpConnector(httpClient))
-        .build()
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), 1.seconds.toJavaDuration())
     private val requestQueue: PaymentChannel = PaymentChannel(retriesConfig.payment.maxRetries)
 
     private val executorThreadNumber = threadPoolsConfig.paymentExternalServiceThreadPoolConfig.threadsNumber
@@ -112,7 +104,6 @@ class PaymentExternalSystemAdapterImpl(
     private val requestHandlerExecutorService = Executors.newFixedThreadPool(requestHandlerThreadNumber) as ThreadPoolExecutor
 
     private val maxConcurrentRequests: Int = parallelRequests
-    private val requestSemaphore = Semaphore(permits = maxConcurrentRequests)
 
     @Volatile
     private var lastRetryAfterTimestamp: Long? = null
@@ -124,6 +115,15 @@ class PaymentExternalSystemAdapterImpl(
 
     private val timeToProcessCounter =
         TimeToProcessCounter(requestAverageProcessingTime, maxConcurrentRequests, rateLimitPerSec)
+
+    private val parallelIdempotencyRequestsExecutorService =
+        ParallelIdempotencyRequestsExecutorService(
+            threadPoolsConfig = threadPoolsConfig,
+            tries = hedgedRequestsConfig.tries,
+            delayTime = hedgedRequestsConfig.delay,
+            properties = properties,
+            logConfig = logConfig,
+        )
 
     init {
         metricsService.registerQueueSizeGauge(accountName, this) { requestQueue.size().toDouble() }
@@ -157,7 +157,7 @@ class PaymentExternalSystemAdapterImpl(
 
             val timeNeededToProcessQueueWithNewRequest = timeToProcessCounter.computeTimeToProcessQueue(requestQueue.size() + 1).toMillis()
 
-            if (timeRemaining <= 0 || timeNeededToProcessQueueWithNewRequest + 100 > timeRemaining) {
+            if (timeRemaining <= 0 || (timeNeededToProcessQueueWithNewRequest + 100 > timeRemaining && queueSimulationEnabled)) {
                 lastRetryAfterTimestamp = currentTime + timeNeededToProcessQueueWithNewRequest
 
                 logger.warn("[$accountName] TooManyRequestsException for paymemt $paymentId, retry-after time $lastRetryAfterTimestamp ms, queue size ${requestQueue.size()}, time needed $timeNeededToProcessQueueWithNewRequest")
@@ -205,21 +205,19 @@ class PaymentExternalSystemAdapterImpl(
         while (true) {
             val request = requestQueue.take()
 
-            if (now() + requestAverageProcessingTime.toMillis() + 100 > request.deadline) {
+            if (now() + requestAverageProcessingTime.toMillis() + 100 > request.deadline && queueSimulationEnabled) {
                 continue
             }
 
-            requestSemaphore.withPermit {
-                processPaymentRequest(request)
-                // TODO: nice idea but token returns into new window and rate limit is breached for good requests
-                // val currentTime = now()
-                // if (currentTime + requestAverageProcessingTime.toMillis() > request.deadline) {
-                //     rateLimiter.returnToken()
-                //     logger.warn("[$accountName] Request ${request.paymentId} missed deadline, returning token to rate limiter")
-                // } else {
-                //     processPaymentRequest(request)
-                // }
-            }
+            processPaymentRequest(request)
+            // TODO: nice idea but token returns into new window and rate limit is breached for good requests
+            // val currentTime = now()
+            // if (currentTime + requestAverageProcessingTime.toMillis() > request.deadline) {
+            //     rateLimiter.returnToken()
+            //     logger.warn("[$accountName] Request ${request.paymentId} missed deadline, returning token to rate limiter")
+            // } else {
+            //     processPaymentRequest(request)
+            // }
 
             backgroundExecutorService.submit {
                 metricsService.incrementCompletedTask(TASK_NAME)
@@ -243,7 +241,6 @@ class PaymentExternalSystemAdapterImpl(
 
         val url = "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=${request.transactionId}&paymentId=${request.paymentId}&amount=${request.amount}"
 
-        rateLimiter.tickSuspend()
         val requestStartTime = now()
         try {
             val responseData: Pair<String, Int>? =
@@ -252,11 +249,7 @@ class PaymentExternalSystemAdapterImpl(
                         request.paymentId,
                         "[$accountName] Submit: ${request.paymentId} , txId: ${request.transactionId}, time spent ${now() - request.paymentStartedAt} ms"
                     )
-                    val response = webClient.post()
-                        .uri(url)
-                        .retrieve()
-                        .toEntity(String::class.java)
-                        .awaitSingle()
+                    val response = parallelIdempotencyRequestsExecutorService.executePaymentCall(url, request.paymentId)
 
                     Pair(response.body ?: "", response.statusCode.value())
                 } catch (e: Exception) {
