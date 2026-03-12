@@ -2,34 +2,29 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig.SlidingWindowType
 import kotlinx.coroutines.*
-import kotlinx.coroutines.reactor.awaitSingle
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import org.slf4j.LoggerFactory
-import org.springframework.http.client.reactive.ReactorClientHttpConnector
-import org.springframework.web.reactive.function.client.WebClient
 import org.springframework.web.reactive.function.client.WebClientRequestException
 import org.springframework.web.reactive.function.client.WebClientResponseException
-import reactor.netty.http.client.HttpClient
-import reactor.netty.http.HttpProtocol
-import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.config.*
-import java.io.IOException
-import java.net.ConnectException
-import java.time.Duration
-import java.util.concurrent.TimeoutException
 import ru.quipy.core.EventSourcingService
 import ru.quipy.metrics.MetricsService
 import ru.quipy.payments.api.PaymentAggregate
+import java.io.IOException
+import java.net.ConnectException
+import java.time.Duration
 import java.util.*
 import java.util.concurrent.Executors
 import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.math.absoluteValue
 import kotlin.time.Duration.Companion.milliseconds
-import kotlin.time.Duration.Companion.seconds
 import kotlin.time.toJavaDuration
 
 // Advice: always treat time as a Duration
@@ -53,27 +48,6 @@ class PaymentExternalSystemAdapterImpl(
         val mapper = ObjectMapper().registerKotlinModule()
 
         private const val TASK_NAME = "paymentTask"
-
-        val retryForbiddenCodes = hashSetOf(
-            // 4xx - клиентские ошибки (бессмысленно ретраить)
-            400, // Bad Request - ошибка в запросе
-            401, // Unauthorized - нужна аутентификация
-            403, // Forbidden - доступ запрещен
-            404, // Not Found - ресурс не найден
-            405, // Method Not Allowed - метод не поддерживается
-            409, // Conflict - конфликт состояний
-            410, // Gone - ресурс удален
-            422, // Unprocessable Entity - семантическая ошибка
-
-            // 429 - Too Many Requests (ретраить нельзя - усугубит)
-            429,
-
-            // 5xx - некоторые серверные ошибки (бессмысленно ретраить)
-            501, // Not Implemented - функционал не реализован
-            502, // Bad Gateway - проблемы прокси
-            503, // Service Unavailable - сервис недоступен
-            504  // Gateway Timeout - таймаут шлюза
-        )
     }
 
     private val serviceName = properties.serviceName
@@ -86,10 +60,17 @@ class PaymentExternalSystemAdapterImpl(
     private val maxParallelRequestsCount =
         maxOf(parallelRequests, rateLimitPerSec * maxOf(1, requestAverageProcessingTime.toSeconds().toInt()))
 
-
-    private val httpClient = HttpClient.create()
-        .protocol(HttpProtocol.H2C)
-        .responseTimeout(Duration.ofMillis(maxOf(requestAverageProcessingTime.multipliedBy(2).toMillis(), 500)))
+    private val circuitBreaker = CircuitBreaker.of(
+        "payment-$accountName",
+        CircuitBreakerConfig.custom()
+            .slidingWindowType(SlidingWindowType.TIME_BASED)
+            .slidingWindowSize(2) // За какие N секунд считаем вызовы
+            .failureRateThreshold(30.0f)
+            .minimumNumberOfCalls(10) // Минимальное число вызовов в окне, прежде чем оценивать threshold
+            .waitDurationInOpenState(Duration.ofSeconds(3)) // Сколько остаётся в состоянии OPEN, прежде чем перейти в HALF_OPEN и попробовать пропустить несколько запросов
+            .permittedNumberOfCallsInHalfOpenState(3) // Сколько запросов разрешено пропустить в HALF_OPEN, чтобы проверить ожил ли сервис
+            .build()
+    )
 
     private val requestQueue: PaymentChannel = PaymentChannel(retriesConfig.payment.maxRetries)
 
@@ -241,6 +222,11 @@ class PaymentExternalSystemAdapterImpl(
 
         val url = "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=${request.transactionId}&paymentId=${request.paymentId}&amount=${request.amount}"
 
+        if (!circuitBreaker.tryAcquirePermission()) {
+            requestQueue.offer(request)
+            return
+        }
+
         val requestStartTime = now()
         try {
             val responseData: Pair<String, Int>? =
@@ -253,6 +239,7 @@ class PaymentExternalSystemAdapterImpl(
 
                     Pair(response.body ?: "", response.statusCode.value())
                 } catch (e: Exception) {
+                    circuitBreaker.onError(now() - requestStartTime, TimeUnit.MILLISECONDS, e)
                     when (e) {
                         is TimeoutException, is TimeoutCancellationException -> {
                             log(
@@ -283,6 +270,15 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             responseData?.let { (bodyString, statusCode) ->
+                if (statusCode in 200..299) {
+                    circuitBreaker.onSuccess(now() - requestStartTime, TimeUnit.MILLISECONDS)
+                } else {
+                    circuitBreaker.onError(
+                        now() - requestStartTime,
+                        TimeUnit.MILLISECONDS,
+                        IllegalStateException("Non-2xx response: $statusCode")
+                    )
+                }
                 val responseTime = now() - requestStartTime
                 backgroundExecutorService.submit {
                     metricsService.recordExternalSystemResponseTime(accountName, responseTime)
@@ -321,6 +317,7 @@ class PaymentExternalSystemAdapterImpl(
             }
 
         } catch (e: Exception) {
+            circuitBreaker.onError(now() - requestStartTime, TimeUnit.MILLISECONDS, e)
             backgroundExecutorService.submit {
                 val responseTime = now() - requestStartTime
                 metricsService.recordExternalSystemResponseTime(accountName, responseTime)

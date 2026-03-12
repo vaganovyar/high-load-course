@@ -1,13 +1,14 @@
 package ru.quipy.payments.logic
 
 import kotlinx.coroutines.*
-import kotlinx.coroutines.reactor.awaitSingle
+import kotlinx.coroutines.reactor.awaitSingleOrNull
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import org.slf4j.LoggerFactory
 import org.springframework.http.ResponseEntity
 import org.springframework.http.client.reactive.ReactorClientHttpConnector
 import org.springframework.web.reactive.function.client.WebClient
+import reactor.core.publisher.Mono
 import reactor.netty.http.HttpProtocol
 import reactor.netty.http.client.HttpClient
 import ru.quipy.common.utils.SlidingWindowRateLimiter
@@ -17,7 +18,6 @@ import java.time.Duration
 import java.util.*
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.absoluteValue
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.toJavaDuration
@@ -75,7 +75,20 @@ class ParallelIdempotencyRequestsExecutorService(
                                 .header("x-idempotency-key", idempotencyKey)
                                 .retrieve()
                                 .toEntity(String::class.java)
-                                .awaitSingle()
+                                .onErrorResume { e ->
+                                    if (e is IllegalStateException &&
+                                        e.message?.contains("response body has been released already") == true
+                                    ) {
+                                        Mono.empty()
+                                    } else {
+                                        Mono.error(e)
+                                    }
+                                }
+                                .awaitSingleOrNull()
+
+                            if (response == null) {
+                                throw CancellationException("Response body released due to cancellation")
+                            }
 
                             if (response.statusCode.is2xxSuccessful) {
                                 if (result.complete(response)) {
